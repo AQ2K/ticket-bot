@@ -379,7 +379,8 @@ async def _run_broadcast(
             blocked.add(user_id)
             failed += 1
         except TelegramError as exc:
-            logger.warning("فشل الإرسال إلى %s: %s", user_id, exc)
+            # لا نسجّل معرّف المستخدم: سجلات GitHub Actions علنية في المستودعات العامة
+            logger.warning("فشل إرسال رسالة جماعية لأحد المستخدمين: %s", exc.__class__.__name__)
             failed += 1
         await asyncio.sleep(0.05)  # ≈ 20 رسالة/ثانية — ضمن حدود تيليجرام
         if index % 25 == 0:
@@ -518,7 +519,9 @@ def main() -> None:
         )
     application = build_application()
     logger.info("🚀 جاري تشغيل بوت OSINT...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # لا نحذف الرسائل المعلّقة: عند إعادة التشغيل الدورية على GitHub تُعالَج الرسائل
+    # التي وصلت أثناء فترة التبديل بدل ضياعها
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 if __name__ == "__main__":

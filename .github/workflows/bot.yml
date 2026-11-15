@@ -1,0 +1,77 @@
+# 🤖 تشغيل بوت OSINT على خوادم GitHub مباشرة — بدون كمبيوتر أو سيرفر
+# ═══════════════════════════════════════════════════════════════════
+# • التوكن يُقرأ من السر BOT_TOKEN في:
+#   Settings ← Secrets and variables ← Actions
+# • GitHub يوقف أي تشغيل بعد 6 ساعات كحد أقصى، لذلك:
+#   - يعمل البوت 5 ساعات و45 دقيقة ثم يتوقف بأمان ويحفظ بياناته.
+#   - تشغيل جديد يكون دائماً في الانتظار (جدولة كل ساعتين) فيستلم فوراً.
+#   - الرسائل التي تصل أثناء التبديل (أقل من دقيقة) لا تضيع.
+
+name: 🤖 تشغيل بوت OSINT
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # زر «Run workflow» للتشغيل اليدوي
+  schedule:
+    - cron: "17 */2 * * *" # كل ساعتين لضمان وجود تشغيل جاهز في الانتظار
+
+# نسخة واحدة فقط تعمل في أي وقت — النسخة الجديدة تنتظر انتهاء الحالية
+# (تشغيل نسختين بنفس التوكن يسبب تعارضاً في تيليجرام)
+concurrency:
+  group: osint-telegram-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      BOT_RUNTIME_SECONDS: "20700" # 5 ساعات و45 دقيقة
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: 🔑 التحقق من وجود التوكن
+        run: |
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "::error::لم تتم إضافة السر BOT_TOKEN — أضفه من Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+      - name: 📥 تحميل الكود
+        uses: actions/checkout@v6
+
+      - name: 🐍 تجهيز بايثون
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 📦 تثبيت المكتبات
+        run: pip install -r requirements.txt
+
+      - name: 💾 استعادة بيانات البوت (المستخدمون والإحصائيات)
+        uses: actions/cache/restore@v5
+        with:
+          path: data
+          key: osint-bot-data-${{ github.run_id }}
+          restore-keys: osint-bot-data-
+
+      - name: 🚀 تشغيل البوت
+        run: |
+          timeout --signal=TERM "$BOT_RUNTIME_SECONDS" python main.py || code=$?
+          if [ "${code:-0}" -eq 124 ]; then
+            echo "⏱️ انتهت مدة هذا التشغيل — التشغيل التالي سيستلم تلقائياً."
+            exit 0
+          fi
+          exit "${code:-0}"
+
+      - name: 💾 حفظ بيانات البوت
+        if: always() && hashFiles('data/**') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: data
+          key: osint-bot-data-${{ github.run_id }}-${{ github.run_attempt }}
