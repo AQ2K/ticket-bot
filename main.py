@@ -24,9 +24,19 @@ import warnings
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
-from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardMarkup, LinkPreviewOptions, Message, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    LinkPreviewOptions,
+    Message,
+    Update,
+)
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
@@ -44,6 +54,7 @@ from telegram.warnings import PTBUserWarning
 
 import config
 import keyboards as kb
+import media_tools as media
 import osint_tools as tools
 
 # ═══════════════════════════════════════════════════════════
@@ -100,6 +111,11 @@ ACTIONS = ActionStore()
 
 # المستخدمون الذين لديهم فحص شامل (WhatsMyName) قيد التنفيذ
 WMN_RUNNING: set[int] = set()
+
+# 📥 التحميلات: تحميل واحد لكل مستخدم، وتحميلان كحد أقصى في نفس الوقت للبوت كله
+DOWNLOADS_RUNNING: set[int] = set()
+DOWNLOAD_SLOTS = asyncio.Semaphore(2)
+_UPLOAD_TIMEOUTS = {"read_timeout": 300, "write_timeout": 300, "connect_timeout": 30, "pool_timeout": 30}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -301,11 +317,15 @@ async def receive_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if category not in kb.CATEGORIES:
         await message.reply_text(kb.CHOOSE_FIRST_TEXT, reply_markup=kb.main_menu_keyboard())
         return ConversationHandler.END
+    # رابط مقطع من TikTok/Instagram/X في أي قسم ← نحمّله مباشرة (هذا غالباً ما يريده المستخدم)
+    if category != "media" and media.is_media_post_url(message.text or ""):
+        category = "media"
     return await _run_category(update, context, category, message.text or "")
 
 
 # ⚡ أوامر مباشرة: «/docs احمد محمد» ينفّذ البحث فوراً بدون المرور بالقائمة
 COMMAND_CATEGORIES: dict[str, str] = {
+    "dl": "media", "account": "accounts", "tiktok": "acc_tiktok", "insta": "acc_insta", "x": "acc_x",
     "dork": "dorks", "dorks": "dorks", "docs": "docs", "social": "social", "domain": "domain",
     "ip": "ip", "phone": "phone", "user": "user", "email": "email",
 }
@@ -421,8 +441,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """نص عادي خارج أي قسم — نذكّر المستخدم باختيار نوع البحث أولاً."""
+    """نص عادي خارج أي قسم: رابط مقطع ← تحميل، رابط حساب ← معلومات الحساب، غير ذلك ← القائمة."""
     _register_user(update, context)
+    text = update.effective_message.text or ""
+    if media.find_media_url(text):
+        category = "media" if media.is_media_post_url(text) else "accounts"
+        await _run_category(update, context, category, text)
+        return
     await update.effective_message.reply_text(kb.CHOOSE_FIRST_TEXT, reply_markup=kb.main_menu_keyboard())
 
 
@@ -631,7 +656,116 @@ async def _action_download(update: Update, context: ContextTypes.DEFAULT_TYPE, a
         await status.delete()
 
 
+async def _send_single_media(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, item: media.MediaItem, caption: str | None
+) -> bool:
+    """إرسال مقطع أو صورة واحدة: ملف محلي، أو رابط يحمّله تيليجرام، أو نحمّله نحن ثم نرفعه."""
+    try:
+        if item.path:
+            data, filename = Path(item.path).read_bytes(), Path(item.path).name
+            if item.kind == "video":
+                await context.bot.send_video(
+                    chat_id, data, filename=filename, caption=caption, supports_streaming=True,
+                    duration=item.duration, width=item.width, height=item.height, **_UPLOAD_TIMEOUTS,
+                )
+            else:
+                await context.bot.send_photo(chat_id, data, filename=filename, caption=caption, **_UPLOAD_TIMEOUTS)
+            return True
+        if item.kind == "video":
+            await context.bot.send_video(chat_id, item.url, caption=caption, supports_streaming=True, **_UPLOAD_TIMEOUTS)
+        else:
+            await context.bot.send_photo(chat_id, item.url, caption=caption, **_UPLOAD_TIMEOUTS)
+        return True
+    except TelegramError as exc:
+        logger.info("📤 تيليجرام لم يقبل الوسائط مباشرة: %s", exc)
+    if not item.url:
+        return False
+    # تيليجرام يحمّل من الروابط حتى 20 ميغابايت فقط — للأكبر نحمّله نحن (حتى 49) ثم نرفعه
+    try:
+        data, filename = await tools.download_file(item.url, max_mb=49)
+        if item.kind == "video":
+            await context.bot.send_video(
+                chat_id, data, filename=filename if "." in filename else "video.mp4", caption=caption,
+                supports_streaming=True, duration=item.duration, **_UPLOAD_TIMEOUTS,
+            )
+        else:
+            await context.bot.send_photo(chat_id, data, filename="photo.jpg", caption=caption, **_UPLOAD_TIMEOUTS)
+        return True
+    except Exception as exc:  # noqa: BLE001 — أخطاء الشبكة أو الرفع
+        logger.warning("📤 تعذّر رفع الوسائط: %s", exc.__class__.__name__)
+        return False
+
+
+async def _send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, result: media.MediaResult) -> bool:
+    """إرسال نتيجة التحميل: مقطع واحد، أو ألبوم (حتى 10 صور/مقاطع)."""
+    chat_id = update.effective_chat.id
+    items = result.items[:10]
+    if len(items) == 1:
+        return await _send_single_media(context, chat_id, items[0], result.caption)
+    album = []
+    for index, item in enumerate(items):
+        source = Path(item.path).read_bytes() if item.path else item.url
+        caption = result.caption if index == 0 else None
+        if item.kind == "video":
+            album.append(InputMediaVideo(source, caption=caption, supports_streaming=True))
+        else:
+            album.append(InputMediaPhoto(source, caption=caption))
+    try:
+        await context.bot.send_media_group(chat_id, album, **_UPLOAD_TIMEOUTS)
+        return True
+    except TelegramError as exc:
+        logger.info("📤 تعذّر إرسال الألبوم، سيتم الإرسال واحداً واحداً: %s", exc)
+    sent = False
+    for index, item in enumerate(items):
+        sent = await _send_single_media(context, chat_id, item, result.caption if index == 0 else None) or sent
+    return sent
+
+
+async def _action_media(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """📥 تحميل مقطع/صور من TikTok أو Instagram أو X وإرسالها داخل المحادثة."""
+    user_id = update.effective_user.id
+    if user_id in DOWNLOADS_RUNNING:
+        await _send(update, context, kb.MEDIA_BUSY_TEXT)
+        return
+    DOWNLOADS_RUNNING.add(user_id)
+    result: media.MediaResult | None = None
+    try:
+        status = await _send(update, context, kb.MEDIA_WAIT_TEXT)
+        with contextlib.suppress(TelegramError):
+            await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
+        try:
+            async with DOWNLOAD_SLOTS:
+                result = await asyncio.wait_for(media.download_media(action.value), timeout=240)
+        except tools.InvalidInput as exc:
+            await status.edit_text(str(exc))
+            return
+        except asyncio.TimeoutError:
+            await status.edit_text(kb.TIMEOUT_TEXT)
+            return
+        if await _send_media(update, context, result):
+            with contextlib.suppress(TelegramError):
+                await status.delete()
+        else:
+            await status.edit_text(kb.MEDIA_SEND_FAILED_TEXT)
+    finally:
+        DOWNLOADS_RUNNING.discard(user_id)
+        if result is not None:
+            result.cleanup()
+
+
+async def _action_tt_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """🎬 آخر فيديوهات حساب TikTok مع زر تحميل لكل فيديو."""
+    status = await _send(update, context, kb.TT_VIDEOS_WAIT_TEXT)
+    videos = await media.tiktok_latest_videos(action.value)
+    user_id = update.effective_user.id
+    buttons = [(n, ACTIONS.put(user_id, tools.Action("📥", "media", v["url"]))) for n, v in enumerate(videos, 1)]
+    markup = kb.search_page_keyboard("-", 0, 1, buttons) if buttons else None
+    await status.edit_text(media.format_tiktok_videos(action.value, videos), reply_markup=markup)
+
+
 ACTION_HANDLERS: dict[str, ActionHandler] = {
+    "media": _action_media,
+    "tt_videos": _action_tt_videos,
     "search": _action_search,
     "subdomains": _action_subdomains,
     "urlscan": _action_urlscan,
@@ -754,6 +888,11 @@ async def post_init(application: Application) -> None:
 
     commands = [
         BotCommand("start", "🏠 القائمة الرئيسية"),
+        BotCommand("dl", "📥 تحميل مقطع من TikTok / Instagram / X — أرسل الرابط"),
+        BotCommand("tiktok", "🎵 معلومات حساب TikTok — مثال: /tiktok khaby.lame"),
+        BotCommand("insta", "📸 معلومات حساب Instagram — مثال: /insta instagram"),
+        BotCommand("x", "𝕏 معلومات حساب X — مثال: /x NASA"),
+        BotCommand("account", "📊 الحساب على TikTok و Instagram و X معاً"),
         BotCommand("dork", "🔎 Google Dorks — مثال: /dork اسم أو دومين"),
         BotCommand("docs", "📄 وثائق وملفات — مثال: /docs احمد محمد"),
         BotCommand("social", "🕵️ X و Instagram و TikTok — مثال: /social @user"),

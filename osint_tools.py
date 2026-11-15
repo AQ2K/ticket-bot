@@ -1785,9 +1785,10 @@ async def _is_public_host(host: str) -> bool:
     return bool(infos) and all(ipaddress.ip_address(str(info[4][0]).split("%")[0]).is_global for info in infos)
 
 
-async def download_file(url: str) -> tuple[bytes, str]:
+async def download_file(url: str, max_mb: int | None = None) -> tuple[bytes, str]:
     """تحميل ملف من نتيجة بحث (بحد أقصى للحجم ومع منع العناوين الداخلية) لإرساله في المحادثة."""
-    max_bytes = config.MAX_DOWNLOAD_MB * 1024 * 1024
+    limit_mb = max_mb or config.MAX_DOWNLOAD_MB
+    max_bytes = limit_mb * 1024 * 1024
     for _ in range(5):  # متابعة التحويلات يدوياً مع فحص كل عنوان
         parts = urlsplit(url)
         if parts.scheme not in ("http", "https") or not parts.hostname:
@@ -1802,13 +1803,13 @@ async def download_file(url: str) -> tuple[bytes, str]:
                 raise InvalidInput(f"❌ تعذّر تحميل الملف (رمز {resp.status_code}).")
             length = resp.headers.get("content-length", "")
             if length.isdigit() and int(length) > max_bytes:
-                raise InvalidInput(f"❌ الملف أكبر من {config.MAX_DOWNLOAD_MB} ميغابايت.")
+                raise InvalidInput(f"❌ الملف أكبر من {limit_mb} ميغابايت.")
             chunks: list[bytes] = []
             size = 0
             async for chunk in resp.aiter_bytes():
                 size += len(chunk)
                 if size > max_bytes:
-                    raise InvalidInput(f"❌ الملف أكبر من {config.MAX_DOWNLOAD_MB} ميغابايت.")
+                    raise InvalidInput(f"❌ الملف أكبر من {limit_mb} ميغابايت.")
                 chunks.append(chunk)
             return b"".join(chunks), _safe_filename(url)
     raise InvalidInput("❌ الرابط يحوّل لعناوين كثيرة جداً.")

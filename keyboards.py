@@ -55,6 +55,37 @@ CATEGORIES: dict[str, dict[str, str]] = {
             "وسأعرض لك قائمة خيارات بحث جاهزة — والنتائج تظهر هنا داخل تيليجرام 👇"
         ),
     },
+    "media": {
+        "title": "📥 تحميل مقاطع",
+        "prompt": (
+            "📥 <b>تحميل مقاطع — TikTok / Instagram / X</b>\n\n"
+            "✍️ أرسل رابط المقطع أو المنشور، مثل:\n"
+            "<code>https://www.tiktok.com/@user/video/123...</code>\n\n"
+            "وسأرسل لك المقطع (أو الصور) هنا مع معلوماته: الناشر، المشاهدات، الإعجابات والتاريخ.\n"
+            "💡 تقدر ترسل الرابط مباشرة في أي وقت بدون فتح القائمة."
+        ),
+    },
+    "accounts": {
+        "title": "📊 معلومات حساب",
+        "prompt": (
+            "📊 <b>معلومات حساب — TikTok / Instagram / X</b>\n\n"
+            "✍️ أرسل اليوزر (مثل <code>khaby.lame</code>) أو رابط الحساب.\n\n"
+            "سأعرض: الاسم، النبذة، المتابِعين، المتابَعين، عدد المنشورات، الإعجابات، التوثيق، "
+            "تاريخ الإنشاء — مع صورة الحساب وآخر الفيديوهات داخل تيليجرام."
+        ),
+    },
+    "acc_tiktok": {
+        "title": "🎵 حساب TikTok",
+        "prompt": "🎵 <b>معلومات حساب TikTok</b>\n\n✍️ أرسل اليوزر أو رابط الحساب، مثل: <code>khaby.lame</code>",
+    },
+    "acc_insta": {
+        "title": "📸 حساب Instagram",
+        "prompt": "📸 <b>معلومات حساب Instagram</b>\n\n✍️ أرسل اليوزر أو رابط الحساب، مثل: <code>instagram</code>",
+    },
+    "acc_x": {
+        "title": "𝕏 حساب X",
+        "prompt": "𝕏 <b>معلومات حساب X (تويتر)</b>\n\n✍️ أرسل اليوزر أو رابط الحساب، مثل: <code>NASA</code>",
+    },
     "social": {
         "title": "🕵️ بحث متقدم (X / Instagram / TikTok)",
         "prompt": (
@@ -161,6 +192,14 @@ WMN_BUSY_TEXT = "⏳ لديك فحص شامل قيد التنفيذ بالفعل
 
 ACTION_ERROR_TEXT = "⚠️ تعذّر جلب النتائج حالياً — حاول مرة أخرى بعد قليل."
 
+MEDIA_WAIT_TEXT = "📥 <b>جاري تحميل المقطع...</b>\nقد يستغرق ذلك حتى دقيقة حسب حجم المقطع."
+
+MEDIA_BUSY_TEXT = "⏳ لديك تحميل قيد التنفيذ بالفعل — انتظر حتى ينتهي."
+
+MEDIA_SEND_FAILED_TEXT = "⚠️ تم التحميل لكن تعذّر إرسال المقطع داخل تيليجرام (قد يكون الحجم كبيراً)."
+
+TT_VIDEOS_WAIT_TEXT = "🎬 <b>جاري جلب آخر الفيديوهات...</b>"
+
 
 def searching_web_text(title: str) -> str:
     return f"🔎 <b>جاري البحث: {title}</b>\nستظهر النتائج هنا خلال ثوانٍ..."
@@ -236,7 +275,8 @@ def welcome_text(first_name: str, setup_hint: bool = False) -> str:
         f"{greeting}"
         "أداة لجمع المعلومات من المصادر المفتوحة (OSINT) وبحث "
         "Google Dorks بضغطة زر — وكل النتائج تظهر هنا داخل تيليجرام.\n\n"
-        "⚡ <b>أو اكتب أمراً مباشرة</b>، مثل: <code>/docs احمد محمد</code> أو <code>/ip 8.8.8.8</code>\n"
+        "📥 <b>أرسل رابط أي مقطع</b> من TikTok أو Instagram أو X وسأحمّله لك فوراً.\n"
+        "⚡ <b>أو اكتب أمراً مباشرة</b>، مثل: <code>/tiktok khaby.lame</code> أو <code>/docs احمد محمد</code>\n"
         "(كل الأوامر في /help)\n\n"
         "👇 <b>اختر نوع البحث:</b>\n\n"
         f"{DISCLAIMER}"
@@ -267,6 +307,11 @@ def help_text(is_admin: bool, search_provider: str | None = None) -> str:
         "3️⃣ أرسل الهدف المطلوب (اسم، يوزر، رابط...).\n"
         "4️⃣ ستصلك النتيجة فوراً، وكل زر يعرض نتائجه هنا داخل تيليجرام.\n\n"
         "<b>⚡ أوامر سريعة (اكتب الأمر ثم الهدف في نفس الرسالة):</b>\n"
+        "/dl <code>رابط المقطع</code> — تحميل من TikTok / Instagram / X\n"
+        "/tiktok <code>يوزر</code> — معلومات حساب TikTok\n"
+        "/insta <code>يوزر</code> — معلومات حساب Instagram\n"
+        "/x <code>يوزر</code> — معلومات حساب X\n"
+        "/account <code>يوزر</code> — الحساب على المنصات الثلاث معاً\n"
         "/dork <code>اسم أو دومين</code> — قائمة Google Dorks\n"
         "/docs <code>احمد محمد</code> — وثائق وملفات\n"
         "/social <code>@username</code> — X و Instagram و TikTok\n"
@@ -340,6 +385,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [_cat("dorks")],
+            [_cat("media"), _cat("accounts")],
             [_cat("social")],
             [_cat("domain"), _cat("ip")],
             [_cat("phone"), _cat("user")],
