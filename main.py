@@ -14,13 +14,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import logging
 import re
+import secrets
 import time
 import warnings
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from functools import wraps
+from typing import Any
 
 from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardMarkup, LinkPreviewOptions, Message, Update
 from telegram.constants import ChatAction, ParseMode
@@ -66,6 +70,38 @@ START_TIME = time.time()
 Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[object]]
 
 
+class ActionStore:
+    """مخزن مؤقت في الذاكرة لبيانات الأزرار.
+
+    بيانات الزر في تيليجرام (callback_data) محدودة بـ 64 بايت، بينما استعلامات البحث أطول،
+    لذلك نحفظ البيانات هنا ونضع في الزر رمزاً قصيراً فقط. كل رمز مرتبط بمستخدم واحد.
+    """
+
+    def __init__(self, limit: int = 20000) -> None:
+        self._items: OrderedDict[str, tuple[int, Any]] = OrderedDict()
+        self._limit = limit
+
+    def put(self, user_id: int, value: Any) -> str:
+        token = secrets.token_urlsafe(6)
+        self._items[token] = (user_id, value)
+        while len(self._items) > self._limit:
+            self._items.popitem(last=False)
+        return token
+
+    def get(self, token: str, user_id: int) -> Any | None:
+        item = self._items.get(token)
+        if item is None or item[0] != user_id:
+            return None
+        self._items.move_to_end(token)
+        return item[1]
+
+
+ACTIONS = ActionStore()
+
+# المستخدمون الذين لديهم فحص شامل (WhatsMyName) قيد التنفيذ
+WMN_RUNNING: set[int] = set()
+
+
 # ═══════════════════════════════════════════════════════════
 # 🔧 دوال مساعدة
 # ═══════════════════════════════════════════════════════════
@@ -104,13 +140,24 @@ def _format_duration(seconds: float) -> str:
     return " و ".join(parts)
 
 
-async def _answer(update: Update) -> None:
+async def _answer(update: Update, text: str | None = None, *, alert: bool = False) -> None:
     """الرد على ضغطة الزر لإيقاف مؤشر التحميل (مع تجاهل الأزرار القديمة جداً)."""
     if update.callback_query:
         try:
-            await update.callback_query.answer()
+            await update.callback_query.answer(text, show_alert=alert)
         except BadRequest:
             pass
+
+
+def _register(update: Update) -> Callable[[tools.Action], str]:
+    """دالة تحفظ بيانات أزرار التقرير وتُرجع رموزها القصيرة."""
+    user_id = update.effective_user.id
+    return lambda action: ACTIONS.put(user_id, action)
+
+
+async def _send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, markup=None) -> Message:
+    """إرسال رسالة جديدة في نفس المحادثة."""
+    return await context.bot.send_message(update.effective_chat.id, text, reply_markup=markup)
 
 
 async def _show(
@@ -276,7 +323,9 @@ async def receive_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     _record_search(context, category)
     context.user_data.pop("category", None)
     try:
-        await status.edit_text(result.text, reply_markup=kb.results_keyboard(result.links, category))
+        await status.edit_text(
+            result.text, reply_markup=kb.results_keyboard(result.actions, category, _register(update))
+        )
     except BadRequest as exc:
         # احتياط: إذا رفض تيليجرام أحد الروابط، نعرض التقرير بدون أزرار الروابط
         logger.warning("تعذّر عرض أزرار النتائج: %s", exc)
@@ -311,6 +360,220 @@ async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """نص عادي خارج أي قسم — نذكّر المستخدم باختيار نوع البحث أولاً."""
     _register_user(update, context)
     await update.effective_message.reply_text(kb.CHOOSE_FIRST_TEXT, reply_markup=kb.main_menu_keyboard())
+
+
+# ═══════════════════════════════════════════════════════════
+# 🔘 أزرار النتائج — كل النتائج تُعرض داخل تيليجرام
+# ═══════════════════════════════════════════════════════════
+
+ActionHandler = Callable[[Update, ContextTypes.DEFAULT_TYPE, tools.Action], Awaitable[None]]
+
+
+async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """تنفيذ زر من أزرار التقرير وعرض نتيجته في المحادثة."""
+    user_id = update.effective_user.id
+    action = ACTIONS.get(update.callback_query.data.partition(":")[2], user_id)
+    if not isinstance(action, tools.Action):
+        await _answer(update, kb.ACTION_EXPIRED_TEXT, alert=True)
+        return
+
+    # ⏳ حماية من الضغط المتكرر (يحمي أيضاً رصيد مفتاح البحث)
+    now = time.time()
+    remaining = config.ACTION_COOLDOWN_SECONDS - (now - context.user_data.get("last_action", 0.0))
+    if remaining > 0:
+        await _answer(update, kb.cooldown_text(remaining))
+        return
+    context.user_data["last_action"] = now
+
+    await _answer(update)
+    handler = ACTION_HANDLERS.get(action.kind)
+    if handler is None:
+        return
+    try:
+        await handler(update, context, action)
+    except Exception:  # noqa: BLE001 — لا نسمح لأي خطأ في زر بإيقاف البوت
+        logger.exception("⚠️ خطأ أثناء تنفيذ زر من نوع %s", action.kind)
+        with contextlib.suppress(TelegramError):
+            await _send(update, context, kb.ACTION_ERROR_TEXT)
+
+
+async def _action_search(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """🔎 بحث Google Dork وعرض النتائج كصفحات داخل تيليجرام."""
+    status = await _send(update, context, kb.searching_web_text(html.escape(action.label)))
+    try:
+        outcome = await asyncio.wait_for(tools.web_search(action.value), timeout=40)
+    except asyncio.TimeoutError:
+        outcome = tools.SearchOutcome([], error="failed")
+    entry = {"title": action.label, "query": action.value, "outcome": outcome, "docs": "docs" in action.extra}
+    token = ACTIONS.put(update.effective_user.id, entry)
+    await _render_search_page(status, update.effective_user.id, token, entry, 0)
+
+
+async def _render_search_page(message: Message, user_id: int, token: str, entry: dict, page: int) -> None:
+    """عرض صفحة من نتائج البحث مع أزرار التحميل والتنقل."""
+    result = tools.format_search_page(entry["title"], entry["query"], entry["outcome"], page)
+    downloads = []
+    if entry["docs"]:
+        for number, item in result.items:
+            if tools.downloadable_ext(item["url"]):
+                downloads.append((number, ACTIONS.put(user_id, tools.Action("📥", "download", item["url"]))))
+    fallback = tools.google(entry["query"]) if not entry["outcome"].items else None
+    markup = kb.search_page_keyboard(token, result.page, result.pages, downloads, fallback)
+    try:
+        await message.edit_text(result.text, reply_markup=markup)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+
+
+async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """التنقل بين صفحات نتائج البحث (بتعديل نفس الرسالة)."""
+    query = update.callback_query
+    _, token, page = query.data.split(":")
+    entry = ACTIONS.get(token, update.effective_user.id)
+    if not isinstance(entry, dict) or not isinstance(query.message, Message):
+        await _answer(update, kb.ACTION_EXPIRED_TEXT, alert=True)
+        return
+    await _answer(update)
+    await _render_search_page(query.message, update.effective_user.id, token, entry, int(page))
+
+
+async def _action_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """🌿 النطاقات الفرعية (crt.sh / HackerTarget)."""
+    status = await _send(update, context, kb.SUBDOMAINS_WAIT_TEXT)
+    try:
+        text = await asyncio.wait_for(tools.subdomains_report(action.value), timeout=60)
+    except asyncio.TimeoutError:
+        text = kb.ACTION_ERROR_TEXT
+    await status.edit_text(text)
+
+
+async def _action_urlscan(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """🔬 آخر فحوصات urlscan.io + لقطة شاشة للموقع داخل المحادثة."""
+    status = await _send(update, context, kb.URLSCAN_WAIT_TEXT)
+    try:
+        text, screenshot = await asyncio.wait_for(tools.urlscan_report(action.value), timeout=30)
+    except asyncio.TimeoutError:
+        text, screenshot = kb.ACTION_ERROR_TEXT, None
+    await status.edit_text(text)
+    if screenshot:
+        with contextlib.suppress(TelegramError):
+            await context.bot.send_photo(
+                update.effective_chat.id,
+                screenshot,
+                caption=f"📸 آخر لقطة شاشة لـ <code>{html.escape(action.value)}</code> (urlscan.io)",
+            )
+
+
+async def _action_map(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """🗺️ إرسال الموقع التقريبي كخريطة داخل تيليجرام."""
+    latitude, longitude, title, address = action.extra
+    await context.bot.send_venue(
+        update.effective_chat.id, latitude=latitude, longitude=longitude, title=title, address=address
+    )
+
+
+async def _action_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """🖼️ إرسال صورة داخل المحادثة (مثل صورة Gravatar)."""
+    caption = html.escape(action.extra[0]) if action.extra else None
+    try:
+        await context.bot.send_photo(update.effective_chat.id, action.value, caption=caption)
+    except TelegramError:
+        await _send(update, context, kb.PHOTO_FAILED_TEXT)
+
+
+async def _action_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """🌐 فتح تقرير من قسم آخر مباشرة (مثل تقرير IP خادم الدومين)."""
+    category = action.extra[0]
+    status = await _send(update, context, kb.SEARCHING_TEXT)
+    try:
+        result = await asyncio.wait_for(tools.run_lookup(category, action.value), timeout=config.LOOKUP_TIMEOUT)
+    except tools.InvalidInput as exc:
+        await status.edit_text(str(exc))
+        return
+    except asyncio.TimeoutError:
+        await status.edit_text(kb.TIMEOUT_TEXT)
+        return
+    _record_search(context, category)
+    await status.edit_text(
+        result.text, reply_markup=kb.results_keyboard(result.actions, category, _register(update))
+    )
+
+
+async def _action_wmn(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """🧭 فحص اليوزر في أكثر من 600 موقع (WhatsMyName) مع شريط تقدم."""
+    user_id = update.effective_user.id
+    if user_id in WMN_RUNNING:
+        await _send(update, context, kb.WMN_BUSY_TEXT)
+        return
+    WMN_RUNNING.add(user_id)
+    try:
+        username = action.value
+        status = await _send(update, context, kb.wmn_progress_text(username, 0, 0))
+        last_edit = time.monotonic()
+
+        async def progress(done: int, total: int) -> None:
+            nonlocal last_edit
+            if time.monotonic() - last_edit < 4:
+                return
+            last_edit = time.monotonic()
+            with contextlib.suppress(TelegramError):
+                await status.edit_text(kb.wmn_progress_text(username, done, total))
+
+        try:
+            hits, checked, total = await tools.wmn_scan(username, progress)
+        except tools.InvalidInput as exc:
+            await status.edit_text(str(exc))
+            return
+        chunks = tools.split_message(tools.format_wmn(username, hits, checked, total))
+        await status.edit_text(chunks[0])
+        for chunk in chunks[1:]:
+            await _send(update, context, chunk)
+    finally:
+        WMN_RUNNING.discard(user_id)
+
+
+async def _action_download(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """📥 إرسال الملف نفسه داخل المحادثة."""
+    url = action.value
+    chat_id = update.effective_chat.id
+    status = await _send(update, context, kb.DOWNLOAD_WAIT_TEXT)
+    with contextlib.suppress(TelegramError):
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+    caption = f"📄 {html.escape(url[:200])}"
+
+    # 1) تيليجرام يحمّل الملف بنفسه من الرابط (يعمل مع PDF و ZIP)
+    try:
+        await context.bot.send_document(chat_id, document=url, caption=caption)
+    except TelegramError:
+        # 2) نحمّله نحن (مع حدود الحجم والأمان) ثم نرفعه
+        try:
+            data, filename = await asyncio.wait_for(tools.download_file(url), timeout=60)
+            await context.bot.send_document(chat_id, document=data, filename=filename, caption=caption)
+        except tools.InvalidInput as exc:
+            error_text = str(exc)
+        except Exception as exc:  # noqa: BLE001 — أخطاء الشبكة أو الرفع
+            logger.warning("📥 تعذّر إرسال ملف: %s", exc.__class__.__name__)
+            error_text = kb.DOWNLOAD_FAILED_TEXT
+        else:
+            error_text = None
+        if error_text:
+            await status.edit_text(error_text, reply_markup=kb.open_link_keyboard(url))
+            return
+    with contextlib.suppress(TelegramError):
+        await status.delete()
+
+
+ACTION_HANDLERS: dict[str, ActionHandler] = {
+    "search": _action_search,
+    "subdomains": _action_subdomains,
+    "urlscan": _action_urlscan,
+    "map": _action_map,
+    "photo": _action_photo,
+    "lookup": _action_lookup,
+    "wmn": _action_wmn,
+    "download": _action_download,
+}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -504,6 +767,8 @@ def build_application() -> Application:
     application.add_handler(
         CallbackQueryHandler(show_dorks_cheatsheet, pattern=rf"^{re.escape(kb.CB_GUIDE_DORKS)}$")
     )
+    application.add_handler(CallbackQueryHandler(action_callback, pattern=rf"^{kb.CB_ACTION}:[\w-]+$"))
+    application.add_handler(CallbackQueryHandler(page_callback, pattern=rf"^{kb.CB_PAGE}:[\w-]+:\d+$"))
     application.add_handler(CallbackQueryHandler(unknown_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
     application.add_error_handler(error_handler)

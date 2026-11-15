@@ -10,12 +10,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup
 
-from osint_tools import Link
+from osint_tools import Action
+
+
+@dataclass(frozen=True)
+class Link:
+    """رابط خارجي ثابت (يُستخدم في دليل المصادر فقط)."""
+
+    label: str
+    url: str
 
 # ═══════════════════════════════════════════════════════════
 # 🔖 بيانات الأزرار (callback_data)
@@ -27,6 +36,8 @@ CB_BACK = "back:main"  # رجوع للقائمة بتعديل نفس الرسا�
 CB_HOME_NEW = "home:new"  # فتح القائمة برسالة جديدة
 CB_GUIDE = "menu:guide"  # دليل المصادر
 CB_GUIDE_DORKS = "guide:dorks"  # ورقة أوامر Google Dorks
+CB_ACTION = "a"  # a:<رمز>        ← تنفيذ إجراء تُعرض نتيجته داخل تيليجرام
+CB_PAGE = "p"  # p:<رمز>:<صفحة> ← التنقل بين صفحات نتائج البحث
 
 # ═══════════════════════════════════════════════════════════
 # 📂 الأقسام
@@ -121,7 +132,40 @@ GENERIC_ERROR_TEXT = (
     "لم يتأثر البوت — حاول مرة أخرى، أو أرسل /start للعودة للقائمة الرئيسية."
 )
 
-BUTTONS_FALLBACK_NOTE = "\n\n⚠️ <i>تعذّر عرض أزرار الروابط لهذه النتيجة.</i>"
+BUTTONS_FALLBACK_NOTE = "\n\n⚠️ <i>تعذّر عرض أزرار هذه النتيجة.</i>"
+
+ACTION_EXPIRED_TEXT = "⌛ انتهت صلاحية هذا الزر (أُعيد تشغيل البوت). ابحث من جديد من القائمة."
+
+SUBDOMAINS_WAIT_TEXT = "🌿 <b>جاري جمع النطاقات الفرعية...</b>\nقد يستغرق ذلك حتى 30 ثانية."
+
+URLSCAN_WAIT_TEXT = "🔬 <b>جاري جلب فحوصات urlscan.io...</b>"
+
+DOWNLOAD_WAIT_TEXT = "📥 <b>جاري تحميل الملف وإرساله...</b>"
+
+DOWNLOAD_FAILED_TEXT = "⚠️ تعذّر إرسال الملف داخل تيليجرام."
+
+PHOTO_FAILED_TEXT = "⚠️ تعذّر إرسال الصورة حالياً."
+
+WMN_BUSY_TEXT = "⏳ لديك فحص شامل قيد التنفيذ بالفعل — انتظر حتى ينتهي."
+
+ACTION_ERROR_TEXT = "⚠️ تعذّر جلب النتائج حالياً — حاول مرة أخرى بعد قليل."
+
+
+def searching_web_text(title: str) -> str:
+    return f"🔎 <b>جاري البحث: {title}</b>\nستظهر النتائج هنا خلال ثوانٍ..."
+
+
+def wmn_progress_text(username: str, done: int, total: int) -> str:
+    if not total:
+        return f"🧭 <b>جاري تحضير الفحص الشامل لليوزر</b> <code>{username}</code>...\nيستغرق الفحص عادةً من 30 إلى 90 ثانية."
+    percent = int(done * 100 / total)
+    filled = percent // 10
+    bar = "▓" * filled + "░" * (10 - filled)
+    return (
+        f"🧭 <b>جاري فحص اليوزر</b> <code>{username}</code> <b>في {total} موقع...</b>\n\n"
+        f"{bar} {percent}%\n"
+        f"تم فحص <b>{done}</b> من <b>{total}</b>"
+    )
 
 CANCELLED_TEXT = "❌ تم إلغاء العملية الحالية.\n\n👇 اختر نوع البحث من جديد:"
 
@@ -277,16 +321,25 @@ def _nav_row(category: str) -> list[Btn]:
     ]
 
 
-def results_keyboard(links: Iterable[Link], category: str, columns: int = 2) -> InlineKeyboardMarkup:
-    """🔗 بناء لوحة أزرار الروابط المباشرة (تفتح في المتصفح) + صف التنقل.
+def results_keyboard(
+    actions: Iterable[Action],
+    category: str,
+    register: Callable[[Action], str],
+    columns: int = 2,
+) -> InlineKeyboardMarkup:
+    """🔘 بناء أزرار التقرير: كل زر يعرض نتيجته داخل تيليجرام (عدا روابط التطبيقات) + صف التنقل.
 
+    register: دالة تحفظ بيانات الإجراء وتُرجع رمزاً قصيراً (callback_data محدود بـ 64 بايت).
     الأزرار العادية تُرتَّب في أعمدة، والأزرار العريضة (wide) تأخذ سطراً كاملاً.
     """
     rows: list[list[Btn]] = []
     pending: list[Btn] = []
-    for link in links:
-        button = Btn(link.label, url=link.url)
-        if link.wide:
+    for action in actions:
+        if action.kind == "url":
+            button = Btn(action.label, url=action.value)
+        else:
+            button = Btn(action.label, callback_data=f"{CB_ACTION}:{register(action)}")
+        if action.wide:
             if pending:
                 rows.append(pending)
                 pending = []
@@ -305,6 +358,34 @@ def results_keyboard(links: Iterable[Link], category: str, columns: int = 2) -> 
 def error_keyboard(category: str) -> InlineKeyboardMarkup:
     """لوحة تظهر عند الخطأ أو انتهاء المهلة: إعادة المحاولة + رجوع."""
     return InlineKeyboardMarkup([_nav_row(category)])
+
+
+def open_link_keyboard(url: str) -> InlineKeyboardMarkup:
+    """زر احتياطي لفتح رابط الملف عند تعذّر إرساله داخل تيليجرام."""
+    return InlineKeyboardMarkup([[Btn("🌐 فتح رابط الملف", url=url)]])
+
+
+def search_page_keyboard(
+    token: str,
+    page: int,
+    pages: int,
+    downloads: list[tuple[int, str]],
+    fallback_url: str | None = None,
+) -> InlineKeyboardMarkup | None:
+    """أزرار صفحة نتائج البحث: تحميل الملفات + التنقل بين الصفحات + بحث Google احتياطي عند الفشل."""
+    rows: list[list[Btn]] = []
+    download_buttons = [Btn(f"📥 {number}", callback_data=f"{CB_ACTION}:{tok}") for number, tok in downloads]
+    rows += [download_buttons[i : i + 5] for i in range(0, len(download_buttons), 5)]
+    nav = []
+    if page > 0:
+        nav.append(Btn("➡️ السابق", callback_data=f"{CB_PAGE}:{token}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(Btn("التالي ⬅️", callback_data=f"{CB_PAGE}:{token}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if fallback_url:
+        rows.append([Btn("🌐 فتح البحث في Google", url=fallback_url)])
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 # روابط دليل المصادر

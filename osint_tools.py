@@ -1,17 +1,26 @@
 """
-🧰 أدوات OSINT — مولّدات Google Dorks ودوال الاستعلام من المصادر العلنية
-=======================================================================
+🧰 أدوات OSINT — جمع المعلومات من المصادر العلنية وعرضها داخل تيليجرام
+=====================================================================
 كل الدوال هنا مستقلة تماماً عن تيليجرام: تستقبل نص المستخدم وتُرجع كائن
-‎LookupResult‎ يحتوي على نص التقرير (بصيغة HTML) وقائمة روابط تتحول لاحقاً
-إلى أزرار في ‎keyboards.py‎.
+‎LookupResult‎ يحتوي على نص التقرير (بصيغة HTML) وقائمة «إجراءات» تتحول في
+‎keyboards.py‎ إلى أزرار تعرض نتائجها داخل المحادثة نفسها.
 
-لا يتطلب أي مفتاح API مدفوع — المصادر المستخدمة مجانية وعلنية:
+المصادر المجانية المستخدمة (بدون مفاتيح):
   • DNS-over-HTTPS من Cloudflare و Google  ← سجلات DNS
   • RDAP (rdap.org)                         ← بيانات تسجيل الدومين و IP (بديل WHOIS)
   • ip-api.com و ipwho.is                   ← الموقع الجغرافي لعناوين IP
-  • Wayback Machine API                     ← لقطات الأرشيف
+  • Shodan InternetDB                       ← المنافذ المفتوحة والثغرات المعروفة
+  • GreyNoise Community و RIPEstat          ← سمعة IP وجهة الإبلاغ عن الإساءة
+  • crt.sh و HackerTarget                   ← النطاقات الفرعية
+  • urlscan.io                              ← فحوصات المواقع ولقطات الشاشة
+  • Wayback Machine                         ← الأرشيف
+  • XposedOrNot                             ← تسريبات البريد الإلكتروني
+  • Gravatar                                ← الملف العلني المرتبط بالبريد
+  • WhatsMyName + واجهات المنصات            ← فحص وجود اسم المستخدم
   • مكتبة phonenumbers (تعمل محلياً)        ← تحليل أرقام الهواتف
-  • واجهات عامة لبعض المنصات                ← فحص وجود اسم المستخدم
+
+البحث داخل تيليجرام (Google Dorks): Serper أو Brave عند توفر مفتاح مجاني،
+وإلا بحث مجاني محدود عبر مكتبة ddgs.
 """
 
 from __future__ import annotations
@@ -20,13 +29,16 @@ import asyncio
 import hashlib
 import ipaddress
 import logging
+import math
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from html import escape
+from html import escape, unescape
+from pathlib import PurePosixPath
 from typing import Any, TypeVar
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
 import phonenumbers
@@ -50,20 +62,42 @@ class InvalidInput(ValueError):
 
 
 @dataclass(frozen=True)
-class Link:
-    """زر رابط مباشر: النص الظاهر + الرابط + هل يأخذ عرض السطر كاملاً."""
+class Action:
+    """زر تحت التقرير.
+
+    kind:
+      url        ← رابط يفتح تطبيقاً (واتساب / تيليجرام)
+      search     ← بحث Google Dork تُعرض نتائجه داخل تيليجرام (value = الاستعلام)
+      subdomains ← النطاقات الفرعية (value = الدومين)
+      urlscan    ← فحوصات urlscan ولقطة شاشة (value = الدومين)
+      map        ← إرسال الموقع على خريطة تيليجرام (extra = خط العرض، خط الطول، العنوان، الوصف)
+      photo      ← إرسال صورة داخل المحادثة (value = رابط الصورة، extra = التعليق)
+      lookup     ← تقرير جديد من قسم آخر (value = الهدف، extra = اسم القسم)
+      wmn        ← فحص اليوزر في +600 موقع (value = اليوزر)
+      download   ← إرسال الملف نفسه داخل المحادثة (value = رابط الملف)
+    """
 
     label: str
-    url: str
+    kind: str
+    value: str = ""
+    extra: tuple = ()
     wide: bool = False
 
 
 @dataclass
 class LookupResult:
-    """نتيجة البحث: نص التقرير (HTML) + أزرار الروابط."""
+    """نتيجة البحث: نص التقرير (HTML) + أزرار الإجراءات."""
 
     text: str
-    links: list[Link] = field(default_factory=list)
+    actions: list[Action] = field(default_factory=list)
+
+
+def url_action(label: str, url: str, *, wide: bool = False) -> Action:
+    return Action(label, "url", url, wide=wide)
+
+
+def search_action(label: str, query: str, *, docs: bool = False, wide: bool = False) -> Action:
+    return Action(label, "search", query, ("docs",) if docs else (), wide)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -75,6 +109,7 @@ _DIGITS_TABLE = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234
 
 # محارف التحكم وعلامات الاتجاه الخفية (تظهر كثيراً عند النسخ من واتساب)
 _INVISIBLE_RE = re.compile(r"[\x00-\x1f\x7f​-‏‪-‮⁦-⁩﻿]")
+_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def esc(value: Any) -> str:
@@ -85,6 +120,11 @@ def esc(value: Any) -> str:
 def esc_attr(value: Any) -> str:
     """تهريب النص لاستخدامه داخل خاصية HTML مثل href."""
     return escape(str(value), quote=True)
+
+
+def strip_tags(text: str | None) -> str:
+    """حذف وسوم HTML من النصوص القادمة من محركات البحث."""
+    return unescape(_TAG_RE.sub("", text or "")).strip()
 
 
 def clean_query(raw: str | None) -> str:
@@ -99,13 +139,8 @@ def clean_query(raw: str | None) -> str:
 
 
 def google(dork: str) -> str:
-    """بناء رابط بحث Google مع ترميز الاستعلام بالكامل."""
+    """رابط بحث Google (يُستخدم فقط كخيار احتياطي عند تعذّر البحث داخل تيليجرام)."""
     return f"https://www.google.com/search?q={quote(dork, safe='')}"
-
-
-def scholar(query: str) -> str:
-    """بناء رابط بحث Google Scholar."""
-    return f"https://scholar.google.com/scholar?q={quote(query, safe='')}"
 
 
 _OPERATOR_RE = re.compile(r"\b(site|filetype|ext|intitle|inurl|intext|before|after):", re.IGNORECASE)
@@ -151,7 +186,7 @@ def _yes_no(value: bool | None) -> str:
 
 
 def _age_text(date_str: str | None) -> str | None:
-    """حساب عمر النطاق من تاريخ التسجيل."""
+    """حساب العمر من تاريخ بصيغة YYYY-MM-DD."""
     if not date_str:
         return None
     try:
@@ -169,6 +204,21 @@ def _age_text(date_str: str | None) -> str | None:
     if months:
         parts.append(f"{months} شهر")
     return " و ".join(parts) if parts else f"{days} يوم"
+
+
+def split_message(text: str, limit: int = 3900) -> list[str]:
+    """تقسيم النص الطويل إلى رسائل (حد تيليجرام 4096 حرفاً) عند فواصل الأسطر."""
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks or [""]
 
 
 async def _safe(awaitable: Awaitable[T], default: T, timeout: float | None = None) -> T:
@@ -212,24 +262,212 @@ async def close_client() -> None:
     _client = None
 
 
-async def _fetch(url: str, *, params: dict | None = None, headers: dict | None = None) -> httpx.Response | None:
+async def _fetch(
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: float | None = None,
+) -> httpx.Response | None:
     """طلب GET آمن — يُرجع None عند أي خطأ في الشبكة."""
+    kwargs: dict[str, Any] = {"params": params, "headers": headers}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
     try:
-        return await get_client().get(url, params=params, headers=headers)
+        return await get_client().get(url, **kwargs)
     except httpx.HTTPError as exc:
         logger.warning("🌐 فشل الطلب إلى %s: %s", urlsplit(url).netloc, exc.__class__.__name__)
         return None
 
 
-async def _get_json(url: str, *, params: dict | None = None, headers: dict | None = None) -> Any | None:
-    """طلب GET يُرجع JSON، أو None عند الفشل أو عند رمز حالة غير 200."""
-    resp = await _fetch(url, params=params, headers=headers)
-    if resp is None or resp.status_code != 200:
+async def _get_json(
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: float | None = None,
+    ok_statuses: tuple[int, ...] = (200,),
+) -> Any | None:
+    """طلب GET يُرجع JSON، أو None عند الفشل أو عند رمز حالة غير متوقع."""
+    resp = await _fetch(url, params=params, headers=headers, timeout=timeout)
+    if resp is None or resp.status_code not in ok_statuses:
         return None
     try:
         return resp.json()
     except ValueError:
         return None
+
+
+# ═══════════════════════════════════════════════════════════
+# 🔎 البحث داخل تيليجرام (Google Dorks)
+# ═══════════════════════════════════════════════════════════
+
+
+@dataclass
+class SearchOutcome:
+    """نتيجة بحث: قائمة النتائج + اسم المصدر + سبب الفشل إن وُجد."""
+
+    items: list[dict]
+    provider: str = ""
+    error: str | None = None  # no_key | failed
+
+
+@dataclass
+class SearchPage:
+    """صفحة واحدة من نتائج البحث جاهزة للعرض."""
+
+    text: str
+    page: int
+    pages: int
+    items: list[tuple[int, dict]]  # (رقم النتيجة، النتيجة)
+
+
+_SEARCH_CACHE: dict[str, tuple[float, SearchOutcome]] = {}
+_SEARCH_CACHE_TTL = 600  # 10 دقائق — يوفّر رصيد مفتاح البحث عند تكرار نفس البحث
+
+
+def _search_item(title: Any, url: Any, snippet: Any) -> dict:
+    return {"title": strip_tags(str(title or "")), "url": str(url or ""), "snippet": strip_tags(str(snippet or ""))}
+
+
+async def _search_serper(query: str) -> list[dict] | None:
+    """نتائج Google عبر Serper.dev (يتطلب SERPER_API_KEY)."""
+    try:
+        resp = await get_client().post(
+            "https://google.serper.dev/search",
+            json={"q": query, "num": 10},
+            headers={"X-API-KEY": config.SERPER_API_KEY},
+            timeout=15,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("🔎 فشل الاتصال بـ Serper: %s", exc.__class__.__name__)
+        return None
+    if resp.status_code != 200:
+        logger.warning("🔎 Serper أعاد الرمز %s (تحقق من المفتاح أو الرصيد)", resp.status_code)
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    return [
+        _search_item(r.get("title"), r.get("link"), r.get("snippet"))
+        for r in data.get("organic") or []
+        if r.get("link")
+    ]
+
+
+async def _search_brave(query: str) -> list[dict] | None:
+    """نتائج Brave Search API (يتطلب BRAVE_API_KEY)."""
+    resp = await _fetch(
+        "https://api.search.brave.com/res/v1/web/search",
+        params={"q": query, "count": 10},
+        headers={"X-Subscription-Token": config.BRAVE_API_KEY, "Accept": "application/json"},
+        timeout=15,
+    )
+    if resp is None or resp.status_code != 200:
+        if resp is not None:
+            logger.warning("🔎 Brave أعاد الرمز %s (تحقق من المفتاح أو الرصيد)", resp.status_code)
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    return [
+        _search_item(r.get("title"), r.get("url"), r.get("description"))
+        for r in (data.get("web") or {}).get("results") or []
+        if r.get("url")
+    ]
+
+
+async def _search_keyless(query: str) -> list[dict] | None:
+    """بحث مجاني بدون مفتاح عبر مكتبة ddgs — محدود لأن محركات البحث كثيراً ما تحجب الخوادم."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        return None
+
+    def run() -> list[dict]:
+        return DDGS(timeout=8).text(query, max_results=10, backend="auto")
+
+    try:
+        results = await asyncio.wait_for(asyncio.to_thread(run), timeout=25)
+    except Exception as exc:  # noqa: BLE001 — المكتبة ترفع أنواعاً مختلفة من الأخطاء
+        logger.info("🔎 البحث المجاني لم يُرجع نتائج: %s", exc.__class__.__name__)
+        return None
+    items = [_search_item(r.get("title"), r.get("href"), r.get("body")) for r in results if r.get("href")]
+    return items or None
+
+
+async def web_search(query: str) -> SearchOutcome:
+    """تنفيذ البحث: Serper ← Brave ← البحث المجاني، مع ذاكرة مؤقتة لمدة 10 دقائق."""
+    key = query.strip().lower()
+    cached = _SEARCH_CACHE.get(key)
+    if cached and time.time() - cached[0] < _SEARCH_CACHE_TTL:
+        return cached[1]
+
+    outcome: SearchOutcome | None = None
+    if config.SERPER_API_KEY:
+        items = await _search_serper(query)
+        if items is not None:
+            outcome = SearchOutcome(items, "Google")
+    if outcome is None and config.BRAVE_API_KEY:
+        items = await _search_brave(query)
+        if items is not None:
+            outcome = SearchOutcome(items, "Brave")
+    if outcome is None:
+        items = await _search_keyless(query)
+        if items is not None:
+            outcome = SearchOutcome(items, "بحث مجاني")
+    if outcome is None:
+        has_key = bool(config.SERPER_API_KEY or config.BRAVE_API_KEY)
+        return SearchOutcome([], error="failed" if has_key else "no_key")
+
+    _SEARCH_CACHE[key] = (time.time(), outcome)
+    if len(_SEARCH_CACHE) > 500:
+        oldest = min(_SEARCH_CACHE, key=lambda k: _SEARCH_CACHE[k][0])
+        _SEARCH_CACHE.pop(oldest, None)
+    return outcome
+
+
+_NUM_EMOJI = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟")
+
+NO_SEARCH_KEY_TEXT = (
+    "⚠️ <b>لم أحصل على نتائج.</b>\n"
+    "محركات البحث تحجب البحث المجاني القادم من الخوادم، لذلك يحتاج البحث داخل تيليجرام "
+    "إلى مفتاح مجاني من <b>serper.dev</b> (2,500 بحث مجاني بدون بطاقة بنكية).\n"
+    "أضفه في GitHub كسرّ باسم <code>SERPER_API_KEY</code> وسيعمل البحث تلقائياً."
+)
+
+
+def format_search_page(title: str, query: str, outcome: SearchOutcome, page: int) -> SearchPage:
+    """تنسيق صفحة من نتائج البحث كنص HTML داخل تيليجرام."""
+    per_page = max(1, config.SEARCH_RESULTS_PER_PAGE)
+    items = outcome.items
+    pages = max(1, math.ceil(len(items) / per_page))
+    page = min(max(page, 0), pages - 1)
+    start = page * per_page
+    chunk = list(enumerate(items[start : start + per_page], start=start + 1))
+
+    lines = [f"🔎 <b>{esc(title)}</b>", f"<code>{esc(_short(query, 200))}</code>", ""]
+    if not items:
+        if outcome.error == "no_key":
+            lines.append(NO_SEARCH_KEY_TEXT)
+        elif outcome.error:
+            lines.append("⚠️ تعذّر الاتصال بمحرك البحث حالياً (قد يكون رصيد المفتاح انتهى) — حاول لاحقاً.")
+        else:
+            lines.append("📭 لا توجد نتائج لهذا البحث.")
+    for number, item in chunk:
+        host = urlsplit(item["url"]).hostname or ""
+        badge = _NUM_EMOJI[number - 1] if number <= len(_NUM_EMOJI) else f"{number}."
+        title_text = esc(_short(item["title"] or host, 90))
+        lines.append(f'{badge} <b><a href="{esc_attr(item["url"])}">{title_text}</a></b>')
+        lines.append(f"🌐 <i>{esc(host)}</i>")
+        if item["snippet"]:
+            lines.append(esc(_short(item["snippet"], 230)))
+        lines.append("")
+    if items:
+        lines.append(f"📄 صفحة {page + 1} من {pages} • {len(items)} نتيجة • المصدر: {esc(outcome.provider)}")
+    return SearchPage(_join(lines).strip(), page, pages, chunk)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -366,9 +604,33 @@ async def ip_geolocation(ip: str) -> dict | None:
     return None
 
 
-async def wayback_snapshot(target: str) -> dict | None:
-    """أحدث لقطة محفوظة في أرشيف Wayback Machine لرابط أو دومين."""
-    data = await _get_json("https://archive.org/wayback/available", params={"url": target})
+async def internetdb(ip: str) -> dict | None:
+    """Shodan InternetDB (مجاني بدون مفتاح): المنافذ المفتوحة، أسماء المضيف، الثغرات المعروفة."""
+    data = await _get_json(f"https://internetdb.shodan.io/{ip}")
+    return data if isinstance(data, dict) else None
+
+
+async def greynoise(ip: str) -> dict | None:
+    """GreyNoise Community: هل يقوم هذا الـ IP بمسح الإنترنت؟ وهل هو خدمة معروفة؟"""
+    data = await _get_json(f"https://api.greynoise.io/v3/community/{ip}", ok_statuses=(200, 404))
+    return data if isinstance(data, dict) and "noise" in data else None
+
+
+async def abuse_contacts(ip: str) -> list[str]:
+    """جهة الإبلاغ عن الإساءة لهذا الـ IP عبر RIPEstat."""
+    data = await _get_json(
+        "https://stat.ripe.net/data/abuse-contact-finder/data.json", params={"resource": ip}
+    )
+    contacts = ((data or {}).get("data") or {}).get("abuse_contacts") if isinstance(data, dict) else None
+    return [str(c) for c in contacts or []][:3]
+
+
+async def wayback_snapshot(target: str, timestamp: str | None = None) -> dict | None:
+    """لقطة من أرشيف Wayback Machine — الأحدث افتراضياً، أو الأقرب لتاريخ معيّن (مثل 19900101 = الأقدم)."""
+    params = {"url": target}
+    if timestamp:
+        params["timestamp"] = timestamp
+    data = await _get_json("https://archive.org/wayback/available", params=params)
     closest = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
     if not (closest.get("available") and closest.get("url")):
         return None
@@ -420,36 +682,31 @@ def normalize_domain(raw: str) -> str:
 
 _SOCIAL_HANDLE_RE = re.compile(r"@?([A-Za-z0-9_.]{2,30})")
 
+_INSIDE_HINT = "👇 اضغط على أي زر وستظهر النتائج هنا داخل تيليجرام."
+
 
 async def social_lookup(query: str) -> LookupResult:
-    """توليد Google Dorks وروابط مباشرة للبحث عن اسم أو يوزر في X و Instagram و TikTok."""
+    """بحث Google Dorks عن اسم أو يوزر في X و Instagram و TikTok — النتائج داخل تيليجرام."""
     q = clean_query(query)
     match = _SOCIAL_HANDLE_RE.fullmatch(q)
     handle = match.group(1) if match else None
     term = phrase(handle or q)
 
     dorks = [
-        ("𝕏 بحث في X", f"site:x.com {term}"),
+        ("𝕏 نتائج X", f"site:x.com {term}"),
         ("🐦 أرشيف Twitter", f"site:twitter.com {term}"),
-        ("📸 Instagram", f"site:instagram.com {term}"),
-        ("🎵 TikTok", f"site:tiktok.com {term}"),
+        ("📸 نتائج Instagram", f"site:instagram.com {term}"),
+        ("🎵 نتائج TikTok", f"site:tiktok.com {term}"),
     ]
     combined = f"{term} (site:x.com OR site:instagram.com OR site:tiktok.com)"
 
-    links = [Link(label, google(dork)) for label, dork in dorks]
-    links.append(Link("🌐 كل المنصات في بحث واحد", google(combined), wide=True))
-    links.append(Link("⚡ بحث X المباشر", f"https://x.com/search?q={quote(handle or q, safe='')}&f=live"))
-    links.append(Link("⚡ بحث TikTok المباشر", f"https://www.tiktok.com/search?q={quote(handle or q, safe='')}"))
-
+    actions = [search_action(label, dork) for label, dork in dorks]
+    actions.append(search_action("🌐 كل المنصات في بحث واحد", combined, wide=True))
     if handle:
-        u = quote(handle, safe="")
-        links += [
-            Link("👤 حساب X", f"https://x.com/{u}"),
-            Link("👤 حساب Instagram", f"https://www.instagram.com/{u}/"),
-            Link("👤 حساب TikTok", f"https://www.tiktok.com/@{u}"),
-            Link("💬 منشورات الحساب على X", f"https://x.com/search?q={quote(f'from:{handle}', safe='')}&f=live"),
-            Link("🗣️ إشارات للحساب خارج X", google(f'"@{handle}" -site:x.com -site:twitter.com')),
-            Link("🕰️ أرشيف الحساب (Wayback)", f"https://web.archive.org/web/*/x.com/{u}*"),
+        actions += [
+            search_action("🗣️ إشارات للحساب خارج X", f'"@{handle}" -site:x.com -site:twitter.com'),
+            search_action("🔗 روابط الحساب (Linktree...)", f'"{handle}" (site:linktr.ee OR site:beacons.ai OR site:linkin.bio)'),
+            Action("🧭 فحص اليوزر في +600 موقع", "wmn", handle, wide=True),
         ]
 
     lines = [
@@ -461,10 +718,10 @@ async def social_lookup(query: str) -> LookupResult:
         "<b>🔎 الاستعلامات المُولّدة (Google Dorks):</b>",
         *[f"• <code>{esc(dork)}</code>" for _, dork in dorks],
         "",
-        "👇 اضغط على أي زر لفتح النتائج مباشرة في المتصفح.",
+        _INSIDE_HINT,
         "💡 <i>نصيحة: جرّب الاسم بالعربية والإنجليزية للحصول على نتائج أشمل.</i>",
     ]
-    return LookupResult(_join(lines), links)
+    return LookupResult(_join(lines), actions)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -494,7 +751,7 @@ def _extract_site(text: str) -> str | None:
 
 
 async def docs_lookup(query: str) -> LookupResult:
-    """البحث عن الوثائق والملفات المنشورة علناً (PDF / Word / Excel / ...)."""
+    """البحث عن الوثائق والملفات المنشورة علناً — النتائج والملفات نفسها داخل تيليجرام."""
     q = clean_query(query)
     site = _extract_site(q)
     all_types = "(filetype:pdf OR filetype:docx OR filetype:xlsx OR filetype:pptx)"
@@ -509,26 +766,22 @@ async def docs_lookup(query: str) -> LookupResult:
             ("📙 PowerPoint", f"{base} (filetype:ppt OR filetype:pptx)"),
             ("🗒️ TXT / CSV", f"{base} (filetype:txt OR filetype:csv)"),
         ]
-        links = [Link(label, google(dork)) for label, dork in dorks]
-        links += [
-            Link("🎓 Scholar", scholar(base)),
-            Link("📂 كل أنواع الملفات", google(f"{base} {all_types}"), wide=True),
-            Link("🕰️ أرشيف Wayback", f"https://web.archive.org/web/*/{site}/*"),
-            Link("🔬 urlscan.io", f"https://urlscan.io/search/#domain:{site}"),
-            Link("🧪 VirusTotal", f"https://www.virustotal.com/gui/domain/{site}"),
-            Link("🔍 صفحات مفهرسة", google(base)),
+        actions = [search_action(label, dork, docs=True) for label, dork in dorks]
+        actions += [
+            search_action("📂 كل أنواع الملفات", f"{base} {all_types}", docs=True, wide=True),
+            search_action("📄 الصفحات المفهرسة", base),
+            Action("🔬 فحوصات ولقطة شاشة", "urlscan", site),
         ]
-        # أحدث لقطة للرابط نفسه، وإن لم توجد فللموقع كاملاً
-        snapshot = await _safe(wayback_snapshot(q), None, timeout=config.HTTP_TIMEOUT)
-        if snapshot is None:
-            snapshot = await _safe(wayback_snapshot(site), None, timeout=config.HTTP_TIMEOUT)
+        first, last = await asyncio.gather(
+            _safe(wayback_snapshot(site, "19900101"), None, timeout=config.HTTP_TIMEOUT),
+            _safe(wayback_snapshot(q), None, timeout=config.HTTP_TIMEOUT),
+        )
+        if last is None:
+            last = await _safe(wayback_snapshot(site), None, timeout=config.HTTP_TIMEOUT)
         mode_lines = [
             f"🔗 تم التعرف على رابط — سيتم حصر البحث داخل: <code>{esc(site)}</code>",
-            (
-                f'🕰️ آخر لقطة في الأرشيف: <a href="{esc_attr(snapshot["url"])}">{esc(snapshot["date"])}</a>'
-                if snapshot
-                else "🕰️ آخر لقطة في الأرشيف: <i>لا توجد لقطات محفوظة</i>"
-            ),
+            _wayback_line("🕰️ أول أرشفة", first),
+            _wayback_line("🕰️ آخر أرشفة", last),
         ]
     else:
         # 🔤 وضع الكلمة المفتاحية
@@ -539,13 +792,14 @@ async def docs_lookup(query: str) -> LookupResult:
             ("📗 Excel", f"{base} (filetype:xls OR filetype:xlsx)"),
             ("📙 PowerPoint", f"{base} (filetype:ppt OR filetype:pptx)"),
             ("🏛️ حكومي/أكاديمي", f"{base} (site:.gov OR site:.edu)"),
+            ("🎓 أبحاث علمية", f"{base} (site:researchgate.net OR site:academia.edu OR site:arxiv.org)"),
             ("📚 Scribd", f"site:scribd.com {base}"),
             ("🖥️ SlideShare", f"site:slideshare.net {base}"),
             ("🗃️ Google Docs/Drive", f"{base} (site:docs.google.com OR site:drive.google.com)"),
         ]
-        links = [Link(label, google(dork)) for label, dork in dorks]
-        links.insert(5, Link("🎓 Scholar", scholar(q)))
-        links.append(Link("📂 كل أنواع الملفات", google(f"{base} {all_types}"), wide=True))
+        file_kinds = {"📕 PDF", "📘 Word", "📗 Excel", "📙 PowerPoint"}
+        actions = [search_action(label, dork, docs=label in file_kinds) for label, dork in dorks]
+        actions.append(search_action("📂 كل أنواع الملفات", f"{base} {all_types}", docs=True, wide=True))
         mode_lines = [f"🔤 كلمة البحث: <code>{esc(q)}</code>"]
 
     lines = [
@@ -556,9 +810,16 @@ async def docs_lookup(query: str) -> LookupResult:
         "<b>🔎 أمثلة على الاستعلامات المُولّدة:</b>",
         *[f"• <code>{esc(dork)}</code>" for _, dork in dorks[:4]],
         "",
-        "👇 اختر نوع الملف لفتح نتائج البحث مباشرة في المتصفح.",
+        _INSIDE_HINT,
+        "📥 <i>في نتائج الملفات اضغط زر التحميل ليصلك الملف نفسه هنا.</i>",
     ]
-    return LookupResult(_join(lines), links)
+    return LookupResult(_join(lines), actions)
+
+
+def _wayback_line(label: str, snapshot: dict | None) -> str:
+    if snapshot:
+        return f'{label}: <a href="{esc_attr(snapshot["url"])}">{esc(snapshot["date"])}</a>'
+    return f"{label}: <i>لا توجد لقطات محفوظة</i>"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -566,22 +827,35 @@ async def docs_lookup(query: str) -> LookupResult:
 # ═══════════════════════════════════════════════════════════
 
 
+def _ports_line(db: dict | None) -> str | None:
+    """سطر المنافذ المفتوحة من Shodan InternetDB."""
+    if not db or not db.get("ports"):
+        return None
+    ports = ", ".join(str(p) for p in sorted(db["ports"])[:15])
+    more = f" (+{len(db['ports']) - 15})" if len(db["ports"]) > 15 else ""
+    return f"• 🛰️ المنافذ المفتوحة: <code>{ports}</code>{more}"
+
+
 async def domain_lookup(query: str) -> LookupResult:
-    """تقرير الدومين: سجلات DNS + بيانات التسجيل RDAP + الاستضافة + روابط أدوات الفحص."""
+    """تقرير الدومين: DNS + RDAP + الاستضافة + المنافذ + الأرشيف، وأزرار تعرض المزيد داخل تيليجرام."""
     q = clean_query(query)
     if is_ip(q):
         raise InvalidInput("ℹ️ هذا عنوان IP وليس دومين — استخدم قسم «🌐 IP» من القائمة الرئيسية.")
     domain = normalize_domain(q)
 
-    a, aaaa, mx, ns, txt, rdap = await asyncio.gather(
+    a, aaaa, mx, ns, txt, rdap, first, last = await asyncio.gather(
         _safe(dns_query(domain, "A"), []),
         _safe(dns_query(domain, "AAAA"), []),
         _safe(dns_query(domain, "MX"), []),
         _safe(dns_query(domain, "NS"), []),
         _safe(dns_query(domain, "TXT"), []),
         _safe(_rdap_domain(domain), None, timeout=15),
+        _safe(wayback_snapshot(domain, "19900101"), None, timeout=config.HTTP_TIMEOUT),
+        _safe(wayback_snapshot(domain), None, timeout=config.HTTP_TIMEOUT),
     )
-    hosting = await _safe(ip_geolocation(a[0]), None) if a else None
+    hosting, db = (None, None)
+    if a:
+        hosting, db = await asyncio.gather(_safe(ip_geolocation(a[0]), None), _safe(internetdb(a[0]), None))
 
     lines: list[str | None] = [f"🌐 <b>تقرير الدومين:</b> <code>{esc(domain)}</code>", ""]
 
@@ -622,32 +896,154 @@ async def domain_lookup(query: str) -> LookupResult:
         lines.append("• لا توجد سجلات DNS — قد يكون النطاق غير مسجَّل أو غير مفعَّل.")
 
     # 🖥️ الاستضافة
-    if hosting:
-        host_name = hosting.get("org") or hosting.get("isp") or "غير معروف"
-        asn = f" ({esc(hosting['asn'])})" if hosting.get("asn") else ""
-        lines += [
-            "",
-            f"<b>🖥️ الاستضافة:</b> {flag(hosting.get('country_code'))} "
-            f"{esc(hosting.get('country') or '')} — {esc(host_name)}{asn}",
-        ]
+    if hosting or db:
+        lines += ["", "<b>🖥️ الخادم:</b>"]
+        if hosting:
+            host_name = hosting.get("org") or hosting.get("isp") or "غير معروف"
+            asn = f" ({esc(hosting['asn'])})" if hosting.get("asn") else ""
+            lines.append(
+                f"• الاستضافة: {flag(hosting.get('country_code'))} "
+                f"{esc(hosting.get('country') or '')} — {esc(host_name)}{asn}"
+            )
+        lines.append(_ports_line(db))
 
-    links = [
-        Link("📜 الشهادات crt.sh", f"https://crt.sh/?q={quote('%.' + domain, safe='')}"),
-        Link("🕰️ Wayback Machine", f"https://web.archive.org/web/*/{domain}/*"),
-        Link("🧪 VirusTotal", f"https://www.virustotal.com/gui/domain/{domain}"),
-        Link("🗂️ SecurityTrails", f"https://securitytrails.com/domain/{domain}/dns"),
-        Link("🔬 urlscan.io", f"https://urlscan.io/search/#domain:{domain}"),
-        Link("🛰️ Shodan", f"https://www.shodan.io/search?query={quote('hostname:' + domain, safe='')}"),
-        Link("📇 WHOIS", f"https://who.is/whois/{domain}"),
-        Link("🧱 BuiltWith", f"https://builtwith.com/{domain}"),
-        Link("🌿 النطاقات الفرعية", google(f"site:*.{domain} -site:www.{domain}")),
-        Link("📂 الملفات المنشورة", google(f"site:{domain} (filetype:pdf OR filetype:docx OR filetype:xlsx)")),
-        Link("🔑 صفحات الدخول", google(f"site:{domain} (inurl:login OR inurl:signin OR intitle:login)")),
-        Link("🗣️ إشارات خارجية", google(f'"{domain}" -site:{domain}')),
-        Link("💻 إشارات في GitHub", google(f'"{domain}" site:github.com')),
-        Link("📋 إشارات في Pastebin", google(f'"{domain}" site:pastebin.com')),
+    # 🕰️ الأرشيف
+    if first or last:
+        lines += ["", "<b>🕰️ الأرشيف (Wayback Machine):</b>", _wayback_line("• أول أرشفة", first), _wayback_line("• آخر أرشفة", last)]
+
+    lines += ["", _INSIDE_HINT]
+
+    actions = [
+        Action("🌿 النطاقات الفرعية", "subdomains", domain),
+        Action("🔬 فحوصات ولقطة شاشة", "urlscan", domain),
     ]
-    return LookupResult(_join(lines), links)
+    if a:
+        actions.append(Action("🌐 تقرير IP الخادم", "lookup", a[0], ("ip",)))
+    actions += [
+        search_action("📂 الملفات المنشورة", f"site:{domain} (filetype:pdf OR filetype:docx OR filetype:xlsx)", docs=True),
+        search_action("📄 الصفحات المفهرسة", f"site:{domain}"),
+        search_action("🔑 صفحات الدخول", f"site:{domain} (inurl:login OR inurl:signin OR intitle:login)"),
+        search_action("🗣️ إشارات خارجية", f'"{domain}" -site:{domain}'),
+        search_action("💻 إشارات في GitHub", f'"{domain}" site:github.com'),
+        search_action("📋 إشارات في Pastebin", f'"{domain}" site:pastebin.com'),
+    ]
+    return LookupResult(_join(lines), actions)
+
+
+def _subdomain_set(raw_names: Any, domain: str) -> set[str]:
+    """تنظيف قائمة أسماء وإبقاء النطاقات الفرعية التابعة للدومين فقط."""
+    names: set[str] = set()
+    for raw in raw_names:
+        for name in str(raw).lower().split("\n"):
+            name = name.strip().removeprefix("*.").rstrip(".")
+            if name and " " not in name and "@" not in name and (name == domain or name.endswith("." + domain)):
+                names.add(name)
+    return names
+
+
+async def _crtsh(domain: str) -> set[str] | None:
+    """النطاقات الفرعية من سجلات شهادات SSL العلنية (crt.sh)."""
+    data = await _get_json(
+        "https://crt.sh/", params={"q": domain, "output": "json", "exclude": "expired"}, timeout=25
+    )
+    if not isinstance(data, list):
+        return None
+    return _subdomain_set((row.get("name_value", "") for row in data if isinstance(row, dict)), domain)
+
+
+async def _certspotter(domain: str) -> set[str] | None:
+    """النطاقات الفرعية من سجلات الشهادات عبر Cert Spotter (سريع ومجاني)."""
+    data = await _get_json(
+        "https://api.certspotter.com/v1/issuances",
+        params={"domain": domain, "include_subdomains": "true", "expand": "dns_names"},
+        timeout=15,
+    )
+    if not isinstance(data, list):
+        return None
+    return _subdomain_set((n for row in data if isinstance(row, dict) for n in row.get("dns_names") or []), domain)
+
+
+async def _subdomain_center(domain: str) -> set[str] | None:
+    """النطاقات الفرعية من قاعدة subdomain.center المجانية."""
+    data = await _get_json("https://api.subdomain.center/", params={"domain": domain}, timeout=25)
+    return _subdomain_set(data, domain) if isinstance(data, list) else None
+
+
+async def _hackertarget(domain: str) -> set[str] | None:
+    """النطاقات الفرعية من HackerTarget (احتياطي مجاني محدود يومياً)."""
+    resp = await _fetch("https://api.hackertarget.com/hostsearch/", params={"q": domain}, timeout=20)
+    if resp is None or resp.status_code != 200:
+        return None
+    text = resp.text.strip()
+    if not text or "error" in text[:80].lower() or "exceeded" in text.lower():
+        return None
+    return _subdomain_set((line.split(",")[0] for line in text.splitlines()), domain)
+
+
+async def subdomains_report(domain: str) -> str:
+    """تقرير النطاقات الفرعية: دمج عدة مصادر مجانية بالتوازي وعرضها داخل تيليجرام."""
+    header = f"🌿 <b>النطاقات الفرعية لـ</b> <code>{esc(domain)}</code>"
+    sources = {"Cert Spotter": _certspotter, "crt.sh": _crtsh, "subdomain.center": _subdomain_center}
+    results = await asyncio.gather(*(_safe(fn(domain), None, timeout=30) for fn in sources.values()))
+    found: set[str] = set()
+    used = []
+    for name, result in zip(sources, results, strict=True):
+        if result:
+            found |= result
+            used.append(name)
+    if not found:
+        fallback = await _safe(_hackertarget(domain), None, timeout=25)
+        if fallback:
+            found, used = fallback, ["HackerTarget"]
+    if not found and all(r is None for r in results):
+        return header + "\n\n⚠️ تعذّر جلب البيانات حالياً من المصادر — حاول بعد قليل."
+    if not found:
+        return header + "\n\n📭 لم يتم العثور على نطاقات فرعية."
+    names = sorted(found, key=lambda n: (n.count("."), n))
+    source = "، ".join(used)
+    shown: list[str] = []
+    budget = 3300
+    for name in names:
+        if budget - len(name) - 1 < 0:
+            break
+        shown.append(name)
+        budget -= len(name) + 1
+    more = len(names) - len(shown)
+    return (
+        f"{header}\n📊 العدد: <b>{len(names)}</b> • المصدر: {source}\n\n"
+        f"<pre>{esc(chr(10).join(shown))}</pre>"
+        + (f"\n<i>(+{more} نطاقات أخرى)</i>" if more else "")
+    )
+
+
+async def urlscan_report(domain: str) -> tuple[str, str | None]:
+    """آخر فحوصات urlscan.io للدومين + رابط لقطة الشاشة لأحدث فحص."""
+    header = f"🔬 <b>فحوصات urlscan.io لـ</b> <code>{esc(domain)}</code>"
+    data = await _get_json(
+        "https://urlscan.io/api/v1/search/", params={"q": f"page.domain:{domain}", "size": 8}, timeout=20
+    )
+    results = data.get("results") if isinstance(data, dict) else None
+    if results is None:
+        return header + "\n\n⚠️ تعذّر الاتصال بـ urlscan.io حالياً — حاول بعد قليل.", None
+    if not results:
+        return header + "\n\n📭 لا توجد فحوصات علنية لهذا الدومين.", None
+    lines = [header, ""]
+    for result in results[:8]:
+        task, page = result.get("task") or {}, result.get("page") or {}
+        url = page.get("url") or task.get("url") or ""
+        rid = result.get("_id")
+        link = f'<a href="https://urlscan.io/result/{esc_attr(rid)}/">{esc(_short(url, 60))}</a>' if rid else esc(_short(url, 60))
+        lines.append(f"• {esc(str(task.get('time', ''))[:10])} {flag(page.get('country'))} {link}")
+        details = [
+            f"IP: <code>{esc(page['ip'])}</code>" if page.get("ip") else None,
+            f"الخادم: {esc(page['server'])}" if page.get("server") else None,
+            f"الحالة: {esc(page['status'])}" if page.get("status") else None,
+        ]
+        details_text = " | ".join(d for d in details if d)
+        if details_text:
+            lines.append(f"   {details_text}")
+    screenshot = next((r.get("screenshot") for r in results if r.get("screenshot")), None)
+    return _join(lines), screenshot
 
 
 # ═══════════════════════════════════════════════════════════
@@ -656,7 +1052,7 @@ async def domain_lookup(query: str) -> LookupResult:
 
 
 async def ip_lookup(query: str) -> LookupResult:
-    """تقرير IP: الموقع الجغرافي، مزود الخدمة، ASN، Reverse DNS، النطاق الشبكي + روابط الفحص."""
+    """تقرير IP: الموقع، المزود، ASN، المنافذ، السمعة، جهة الإبلاغ — وخريطة داخل تيليجرام."""
     q = clean_query(query).translate(_DIGITS_TABLE)
     note = None
     try:
@@ -684,10 +1080,13 @@ async def ip_lookup(query: str) -> LookupResult:
         )
 
     ip_str = str(ip)
-    geo, rdap, ptr = await asyncio.gather(
+    geo, rdap, ptr, db, noise, abuse = await asyncio.gather(
         _safe(ip_geolocation(ip_str), None),
         _safe(rdap_lookup("ip", ip_str), None),
         _safe(dns_query(ip.reverse_pointer, "PTR"), []),
+        _safe(internetdb(ip_str), None),
+        _safe(greynoise(ip_str), None),
+        _safe(abuse_contacts(ip_str), []),
     )
 
     lines: list[str | None] = [f"🌐 <b>تقرير IP:</b> <code>{ip_str}</code> (IPv{ip.version})"]
@@ -695,6 +1094,7 @@ async def ip_lookup(query: str) -> LookupResult:
         lines.append(note)
     lines.append("")
 
+    place = None
     if geo:
         place = " — ".join(p for p in (geo.get("region"), geo.get("city")) if p)
         coords = f"{geo['lat']}, {geo['lon']}" if geo.get("lat") is not None else None
@@ -719,35 +1119,63 @@ async def ip_lookup(query: str) -> LookupResult:
     reverse = (ptr[0] if ptr else None) or (geo or {}).get("reverse")
     lines.append(_kv("🔁 Reverse DNS", reverse))
 
+    # 🛰️ Shodan InternetDB
+    if db:
+        lines += ["", "<b>🛰️ المنافذ والخدمات (Shodan InternetDB):</b>", _ports_line(db)]
+        if db.get("hostnames"):
+            lines.append(_kv("أسماء المضيف", ", ".join(db["hostnames"][:5])))
+        if db.get("tags"):
+            lines.append(_kv("الوسوم", ", ".join(db["tags"][:6])))
+        if db.get("cpes"):
+            lines.append(_kv("البرمجيات المكتشفة", ", ".join(c.removeprefix("cpe:/") for c in db["cpes"][:4])))
+        vulns = db.get("vulns") or []
+        if vulns:
+            shown = ", ".join(vulns[:6]) + (f" (+{len(vulns) - 6})" if len(vulns) > 6 else "")
+            lines.append(f"• ⚠️ ثغرات معروفة: <b>{len(vulns)}</b> — <code>{esc(shown)}</code>")
+
+    # 📡 السمعة
+    if noise:
+        if noise.get("riot"):
+            reputation = f"✅ خدمة معروفة وموثوقة ({esc(noise.get('name') or '')})"
+        elif noise.get("noise"):
+            classification = {"malicious": "🔴 ضار", "benign": "🟢 غير ضار", "unknown": "🟡 غير معروف"}.get(
+                str(noise.get("classification")), "🟡 غير معروف"
+            )
+            reputation = f"📡 يقوم بمسح الإنترنت — التصنيف: {classification}"
+        else:
+            reputation = "⚪ لم يُرصد وهو يمسح الإنترنت"
+        lines += ["", f"<b>📡 السمعة (GreyNoise):</b> {reputation}"]
+    if abuse:
+        lines.append(_kv("🚨 الإبلاغ عن إساءة", ", ".join(abuse)))
+
     if rdap:
         start, end = rdap.get("startAddress"), rdap.get("endAddress")
         net_range = f"{start} - {end}" if start and end else None
-        net_name = rdap.get("name") or rdap.get("handle")
         lines += [
             "",
             "<b>📶 بيانات الشبكة (RDAP):</b>",
-            _kv("اسم الشبكة", net_name),
+            _kv("اسم الشبكة", rdap.get("name") or rdap.get("handle")),
             _kv("النطاق", net_range),
             _kv("الجهة المسجِّلة", _rdap_entity_name(rdap, "registrant"), code=False),
         ]
 
     lines += ["", "ℹ️ <i>الموقع الجغرافي تقريبي ويعكس موقع مزود الخدمة وليس موقع الشخص.</i>"]
 
-    links = []
+    actions: list[Action] = []
     if geo and geo.get("lat") is not None:
-        links.append(Link("🗺️ عرض على الخريطة", f"https://www.google.com/maps?q={geo['lat']},{geo['lon']}", wide=True))
-    links += [
-        Link("🛰️ Shodan", f"https://www.shodan.io/host/{ip_str}"),
-        Link("🔭 Censys", f"https://search.censys.io/hosts/{ip_str}"),
-        Link("🚨 AbuseIPDB", f"https://www.abuseipdb.com/check/{ip_str}"),
-        Link("🧪 VirusTotal", f"https://www.virustotal.com/gui/ip-address/{ip_str}"),
-        Link("📡 GreyNoise", f"https://viz.greynoise.io/ip/{ip_str}"),
-        Link("ℹ️ ipinfo.io", f"https://ipinfo.io/{ip_str}"),
-        Link("🌐 BGP (Hurricane Electric)", f"https://bgp.he.net/ip/{ip_str}"),
-        Link("🛡️ Cisco Talos", f"https://talosintelligence.com/reputation_center/lookup?search={ip_str}"),
-        Link("🔎 إشارات في Google", google(f'"{ip_str}"'), wide=True),
-    ]
-    return LookupResult(_join(lines), links)
+        address = ", ".join(p for p in (geo.get("city"), geo.get("region"), geo.get("country")) if p)
+        actions.append(
+            Action("🗺️ عرض الموقع على الخريطة", "map", ip_str,
+                   (float(geo["lat"]), float(geo["lon"]), f"📍 موقع تقريبي لـ {ip_str}", address or ip_str), wide=True)
+        )
+    actions.append(search_action("🔎 إشارات في الإنترنت", f'"{ip_str}"'))
+    actions.append(search_action("🚨 بلاغات وتقارير", f'"{ip_str}" (abuse OR spam OR malware OR phishing)'))
+    if reverse and not is_ip(reverse):
+        try:
+            actions.append(Action("🌐 فحص الدومين المرتبط", "lookup", normalize_domain(reverse), ("domain",), wide=True))
+        except InvalidInput:
+            pass
+    return LookupResult(_join(lines), actions)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -794,7 +1222,7 @@ def _parse_phone(raw: str) -> phonenumbers.PhoneNumber:
 
 
 def _phone_report(raw: str) -> LookupResult:
-    """تحليل الرقم محلياً (بدون إنترنت) وبناء التقرير والروابط."""
+    """تحليل الرقم محلياً (بدون إنترنت) وبناء التقرير والأزرار."""
     number = _parse_phone(clean_query(raw))
     e164 = phonenumbers.format_number(number, PhoneNumberFormat.E164)
     intl = phonenumbers.format_number(number, PhoneNumberFormat.INTERNATIONAL)
@@ -824,29 +1252,22 @@ def _phone_report(raw: str) -> LookupResult:
         f"• صالح وفق خطة الترقيم: {_yes_no(valid)}",
         "",
         "ℹ️ <i>المشغّل المعروض هو المشغّل الأصلي للرقم وقد يكون نُقل لمشغّل آخر.</i>",
+        "",
+        _INSIDE_HINT,
     ]
 
-    links = [
-        Link("💬 واتساب", f"https://wa.me/{digits}"),
-        Link("✈️ تيليجرام", f"https://t.me/+{digits}"),
-        Link("🔎 Google (كل الصيغ)", google(f'"{e164}" OR "{intl}" OR "{national}"'), wide=True),
-    ]
-    if region:
-        links.append(
-            Link("📇 Truecaller", f"https://www.truecaller.com/search/{region.lower()}/{number.national_number}")
-        )
-    links += [
-        Link("📇 Sync.me", f"https://sync.me/search/?number={digits}"),
-        Link(
+    actions = [
+        url_action("💬 فتح في واتساب", f"https://wa.me/{digits}"),
+        url_action("✈️ فتح في تيليجرام", f"https://t.me/+{digits}"),
+        search_action("🔎 بحث بكل الصيغ", f'"{e164}" OR "{intl}" OR "{national}"', wide=True),
+        search_action(
             "👥 إشارات في الشبكات الاجتماعية",
-            google(
-                f'("{e164}" OR "{national}") '
-                "(site:facebook.com OR site:x.com OR site:instagram.com OR site:linkedin.com)"
-            ),
+            f'("{e164}" OR "{national}") '
+            "(site:facebook.com OR site:x.com OR site:instagram.com OR site:linkedin.com)",
             wide=True,
         ),
     ]
-    return LookupResult(_join(lines), links)
+    return LookupResult(_join(lines), actions)
 
 
 async def phone_lookup(query: str) -> LookupResult:
@@ -896,18 +1317,16 @@ _PLATFORMS: tuple[_Platform, ...] = (
               r"[A-Za-z0-9_-]{2,20}"),
 )
 
-# روابط مباشرة لمنصات لا يمكن فحصها بدون تسجيل دخول (يفتحها المستخدم بنفسه)
-_PROFILE_LINKS: tuple[tuple[str, str], ...] = (
-    ("𝕏 X", "https://x.com/{u}"),
-    ("📸 Instagram", "https://www.instagram.com/{u}/"),
-    ("🎵 TikTok", "https://www.tiktok.com/@{u}"),
-    ("📘 Facebook", "https://www.facebook.com/{u}"),
-    ("▶️ YouTube", "https://www.youtube.com/@{u}"),
-    ("👻 Snapchat", "https://www.snapchat.com/add/{u}"),
-    ("🧵 Threads", "https://www.threads.net/@{u}"),
-    ("👽 Reddit", "https://www.reddit.com/user/{u}"),
-    ("🎮 Twitch", "https://www.twitch.tv/{u}"),
-    ("📌 Pinterest", "https://www.pinterest.com/{u}/"),
+# منصات لا يمكن فحصها بدون تسجيل دخول — نبحث عنها داخل تيليجرام عبر Google Dorks
+_SEARCH_PLATFORMS: tuple[tuple[str, str], ...] = (
+    ("𝕏 X", "x.com"),
+    ("📸 Instagram", "instagram.com"),
+    ("🎵 TikTok", "tiktok.com"),
+    ("📘 Facebook", "facebook.com"),
+    ("▶️ YouTube", "youtube.com"),
+    ("👻 Snapchat", "snapchat.com"),
+    ("👽 Reddit", "reddit.com"),
+    ("💼 LinkedIn", "linkedin.com"),
 )
 
 _USERNAME_RE = re.compile(r"[A-Za-z0-9._-]{2,40}")
@@ -954,7 +1373,7 @@ async def _check_platform(platform: _Platform, username: str) -> tuple[str, Any]
 
 
 async def username_lookup(query: str) -> LookupResult:
-    """فحص وجود اسم المستخدم على عدة منصات + ملف GitHub العلني + روابط مباشرة."""
+    """فحص وجود اسم المستخدم على عدة منصات + ملف GitHub العلني + فحص شامل وبحث داخل تيليجرام."""
     q = clean_query(query).lstrip("@").strip()
     if not _USERNAME_RE.fullmatch(q):
         raise InvalidInput(
@@ -1009,14 +1428,152 @@ async def username_lookup(query: str) -> LookupResult:
             _kv("تاريخ الإنشاء", created),
         ]
 
-    lines += ["", "👇 روابط مباشرة لمنصات تتطلب فتحها يدوياً للتحقق:"]
-
-    links = [Link(label, url.format(u=u)) for label, url in _PROFILE_LINKS]
-    links += [
-        Link("🧭 WhatsMyName (فحص +600 موقع)", f"https://whatsmyname.app/?q={u}", wide=True),
-        Link("🔎 بحث Google عن اليوزر", google(f'"{username}"'), wide=True),
+    lines += [
+        "",
+        "🧭 اضغط «فحص شامل» لفحص اليوزر في أكثر من 600 موقع، أو ابحث عنه في المنصات الكبرى — "
+        "كل النتائج تظهر هنا داخل تيليجرام.",
     ]
-    return LookupResult(_join(lines), links)
+
+    actions = [Action("🧭 فحص شامل في +600 موقع (WhatsMyName)", "wmn", username, wide=True)]
+    actions += [search_action(f"{label}", f'site:{site} "{username}"') for label, site in _SEARCH_PLATFORMS]
+    actions.append(search_action("🔎 كل الإشارات في الإنترنت", f'"{username}"', wide=True))
+    return LookupResult(_join(lines), actions)
+
+
+# ═══════════════════════════════════════════════════════════
+# 🧭 الفحص الشامل لليوزر (WhatsMyName — أكثر من 600 موقع)
+# ═══════════════════════════════════════════════════════════
+
+_WMN_DATA_URL = "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json"
+_WMN_SKIP_CATEGORIES = {"xx NSFW xx", "archived", "dating"}
+_WMN_OK_PROTECTION = {"user-agent"}  # المواقع المحمية بـ Cloudflare وغيرها تفشل غالباً من الخوادم
+_WMN_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+)
+_wmn_cache: dict[str, Any] = {"sites": [], "time": 0.0}
+
+WMN_CATEGORIES_AR = {
+    "social": "👥 تواصل اجتماعي", "gaming": "🎮 ألعاب", "tech": "💻 تقنية", "coding": "👨‍💻 برمجة",
+    "hobby": "🎨 هوايات", "music": "🎵 موسيقى", "shopping": "🛍️ تسوق", "finance": "💰 مالية",
+    "business": "💼 أعمال", "images": "🖼️ صور", "blog": "✍️ مدونات", "art": "🖌️ فن",
+    "video": "🎬 فيديو", "political": "🏛️ سياسة", "news": "📰 أخبار", "health": "🩺 صحة",
+    "misc": "📦 متنوع",
+}
+
+
+@dataclass(frozen=True)
+class WmnHit:
+    name: str
+    url: str
+    category: str
+
+
+async def _wmn_sites() -> list[dict]:
+    """تحميل قائمة المواقع من مشروع WhatsMyName (مع تخزين مؤقت لمدة 24 ساعة)."""
+    if _wmn_cache["sites"] and time.time() - _wmn_cache["time"] < 86400:
+        return _wmn_cache["sites"]
+    data = await _get_json(_WMN_DATA_URL, timeout=30)
+    if not isinstance(data, dict):
+        return _wmn_cache["sites"]
+    sites = [
+        s for s in data.get("sites") or []
+        if isinstance(s, dict)
+        and "{account}" in str(s.get("uri_check", ""))
+        and s.get("cat") not in _WMN_SKIP_CATEGORIES
+        and s.get("valid", True)
+        and set(s.get("protection") or []) <= _WMN_OK_PROTECTION
+    ]
+    _wmn_cache.update(sites=sites, time=time.time())
+    return sites
+
+
+async def wmn_scan(
+    username: str, progress: Callable[[int, int], Awaitable[None]] | None = None
+) -> tuple[list[WmnHit], int, int]:
+    """فحص وجود اليوزر في كل مواقع WhatsMyName بالتوازي. يُرجع (النتائج، عدد ما تم فحصه، الإجمالي)."""
+    sites = await _wmn_sites()
+    if not sites:
+        raise InvalidInput("⚠️ تعذّر تحميل قائمة مواقع WhatsMyName حالياً — حاول لاحقاً.")
+
+    hits: list[WmnHit] = []
+    done = 0
+    semaphore = asyncio.Semaphore(config.WMN_CONCURRENCY)
+    headers = {
+        "User-Agent": _WMN_BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(config.WMN_SITE_TIMEOUT),
+        follow_redirects=False,  # قواعد WhatsMyName تعتمد على رموز التحويل (301/302)
+        headers=headers,
+        limits=httpx.Limits(max_connections=config.WMN_CONCURRENCY),
+    ) as client:
+
+        async def check(site: dict) -> None:
+            nonlocal done
+            account = username
+            for char in str(site.get("strip_bad_char") or ""):
+                account = account.replace(char, "")
+            safe_account = quote(account, safe="")
+            url = str(site["uri_check"]).replace("{account}", safe_account)
+            try:
+                async with semaphore:
+                    extra_headers = site.get("headers") if isinstance(site.get("headers"), dict) else None
+                    if site.get("post_body"):
+                        body = str(site["post_body"]).replace("{account}", account)
+                        resp = await client.post(url, content=body, headers=extra_headers)
+                    else:
+                        resp = await client.get(url, headers=extra_headers)
+                if resp.status_code == site.get("e_code") and str(site.get("e_string", "")) in resp.text:
+                    pretty = str(site.get("uri_pretty") or site["uri_check"]).replace("{account}", safe_account)
+                    hits.append(WmnHit(str(site.get("name", "?")), pretty, str(site.get("cat") or "misc")))
+            except (httpx.HTTPError, UnicodeError, ValueError):
+                pass
+            finally:
+                done += 1
+
+        tasks = [asyncio.create_task(check(site)) for site in sites]
+        deadline = asyncio.get_running_loop().time() + config.WMN_MAX_SECONDS
+        pending: set[asyncio.Task] = set(tasks)
+        while pending:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            _, pending = await asyncio.wait(pending, timeout=min(4.0, remaining))
+            if progress is not None and pending:
+                try:
+                    await progress(done, len(sites))
+                except Exception:  # noqa: BLE001 — فشل تحديث رسالة التقدم لا يوقف الفحص
+                    pass
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    hits.sort(key=lambda h: (h.category, h.name.lower()))
+    return hits, done, len(sites)
+
+
+def format_wmn(username: str, hits: list[WmnHit], checked: int, total: int) -> str:
+    """تنسيق نتائج الفحص الشامل مجمّعة حسب التصنيف."""
+    lines = [
+        f"🧭 <b>نتائج الفحص الشامل لليوزر:</b> <code>{esc(username)}</code>",
+        f"✅ تم العثور عليه في <b>{len(hits)}</b> موقع من أصل <b>{checked}</b> تم فحصها"
+        + (f" (من {total})" if checked < total else ""),
+    ]
+    if not hits:
+        lines += ["", "📭 لم يتم العثور على حسابات بهذا الاسم."]
+    current = None
+    for hit in hits:
+        if hit.category != current:
+            current = hit.category
+            lines += ["", f"<b>{esc(WMN_CATEGORIES_AR.get(current, '📦 ' + current))}</b>"]
+        lines.append(f'• <a href="{esc_attr(hit.url)}">{esc(hit.name)}</a>')
+    lines += ["", "ℹ️ <i>المصدر: مشروع WhatsMyName — قد توجد نتائج خاطئة، تحقّق يدوياً من الحسابات المهمة.</i>"]
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1056,8 +1613,35 @@ async def _gravatar_exists(email_md5: str) -> bool | None:
     return None
 
 
+async def gravatar_profile(email_md5: str) -> dict | None:
+    """الملف العلني في Gravatar (الاسم، الموقع، الحسابات المرتبطة)."""
+    data = await _get_json(f"https://en.gravatar.com/{email_md5}.json")
+    entries = data.get("entry") if isinstance(data, dict) else None
+    return entries[0] if isinstance(entries, list) and entries and isinstance(entries[0], dict) else None
+
+
+async def email_breaches(email: str) -> list[str] | None:
+    """أسماء التسريبات المعروفة التي ظهر فيها البريد (XposedOrNot — مجاني). None = تعذّر التحقق."""
+    resp = await _fetch(f"https://api.xposedornot.com/v1/check-email/{quote(email, safe='@')}", timeout=15)
+    if resp is None:
+        return None
+    if resp.status_code == 404:
+        return []
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    breaches = data.get("breaches") if isinstance(data, dict) else None
+    if not breaches:
+        return []
+    flat = breaches[0] if isinstance(breaches[0], list) else breaches
+    return [str(b) for b in flat if b]
+
+
 async def email_lookup(query: str) -> LookupResult:
-    """تقرير البريد: نوع المزود، سجلات MX، حماية SPF/DMARC، Gravatar + روابط فحص التسريبات."""
+    """تقرير البريد: المزود، MX، SPF/DMARC، التسريبات، Gravatar — كله داخل تيليجرام."""
     email = clean_query(query).lower()
     if not _EMAIL_RE.match(email):
         raise InvalidInput("❌ البريد الإلكتروني غير صالح. أرسل بريداً مثل <code>name@example.com</code>")
@@ -1066,11 +1650,13 @@ async def email_lookup(query: str) -> LookupResult:
     email = f"{local}@{domain}"
     email_md5 = hashlib.md5(email.encode(), usedforsecurity=False).hexdigest()
 
-    mx, txt, dmarc, gravatar = await asyncio.gather(
+    mx, txt, dmarc, gravatar, profile, breaches = await asyncio.gather(
         _safe(dns_query(domain, "MX"), []),
         _safe(dns_query(domain, "TXT"), []),
         _safe(dns_query(f"_dmarc.{domain}", "TXT"), []),
         _safe(_gravatar_exists(email_md5), None),
+        _safe(gravatar_profile(email_md5), None),
+        _safe(email_breaches(email), None),
     )
 
     if domain in _DISPOSABLE_DOMAINS:
@@ -1108,24 +1694,113 @@ async def email_lookup(query: str) -> LookupResult:
         f"• حماية DMARC: {'✅ مفعّلة' if dmarc_rec else '❌ غير موجودة'}"
         + (f" (السياسة: <code>{esc(dmarc_policy)}</code>)" if dmarc_policy else ""),
         f"• Gravatar: {gravatar_text[gravatar]}",
-        "",
-        "💡 <i>استخدم الأزرار بالأسفل للتحقق من ظهور البريد في التسريبات العلنية أو على الإنترنت.</i>",
     ]
 
-    e = quote(email, safe="@")
-    links = [
-        Link("🔐 Have I Been Pwned", f"https://haveibeenpwned.com/account/{e}"),
-        Link("🧬 Epieos", f"https://epieos.com/?q={e}&t=email"),
-        Link("🔎 Google", google(f'"{email}"')),
-        Link("📋 Pastebin", google(f'"{email}" site:pastebin.com')),
-        Link("💻 GitHub", google(f'"{email}" site:github.com')),
-        Link("📮 MXToolbox", f"https://mxtoolbox.com/SuperTool.aspx?action=mx%3a{domain}&run=toolpage"),
-    ]
+    # 🔐 التسريبات
+    lines += ["", "<b>🔐 التسريبات المعروفة (XposedOrNot):</b>"]
+    if breaches is None:
+        lines.append("❔ تعذّر التحقق حالياً — حاول لاحقاً.")
+    elif not breaches:
+        lines.append("✅ لم يظهر هذا البريد في أي تسريب معروف.")
+    else:
+        shown_breaches = "، ".join(esc(b) for b in breaches[:25])
+        more = f" <i>(+{len(breaches) - 25})</i>" if len(breaches) > 25 else ""
+        lines += [f"⚠️ ظهر في <b>{len(breaches)}</b> تسريباً:", f"{shown_breaches}{more}"]
+
+    # 👤 ملف Gravatar العلني
+    if profile:
+        accounts = [
+            f'<a href="{esc_attr(acc["url"])}">{esc(acc.get("shortname") or acc.get("domain") or "حساب")}</a>'
+            for acc in profile.get("accounts") or []
+            if isinstance(acc, dict) and acc.get("url")
+        ][:8]
+        lines += [
+            "",
+            "<b>👤 ملف Gravatar العلني:</b>",
+            _kv("الاسم", profile.get("displayName") or profile.get("preferredUsername"), code=False),
+            _kv("الموقع", profile.get("currentLocation"), code=False),
+            _kv("النبذة", _short(str(profile["aboutMe"]), 150) if profile.get("aboutMe") else None, code=False),
+            f"• الحسابات المرتبطة: {'، '.join(accounts)}" if accounts else None,
+        ]
+
+    lines += ["", _INSIDE_HINT]
+
+    actions: list[Action] = []
     if gravatar:
-        links.append(Link("🖼️ صورة Gravatar", f"https://www.gravatar.com/avatar/{email_md5}?s=400"))
+        actions.append(
+            Action("🖼️ عرض صورة Gravatar", "photo", f"https://www.gravatar.com/avatar/{email_md5}?s=600",
+                   (f"🖼️ صورة Gravatar المرتبطة بـ {email}",), wide=True)
+        )
+    actions += [
+        search_action("🔎 بحث عن البريد", f'"{email}"'),
+        search_action("📋 Pastebin", f'"{email}" site:pastebin.com'),
+        search_action("💻 GitHub", f'"{email}" site:github.com'),
+    ]
     if domain not in _FREE_PROVIDERS and domain not in _DISPOSABLE_DOMAINS:
-        links.append(Link("🏢 عناوين أخرى على نفس النطاق", google(f'"@{domain}"'), wide=True))
-    return LookupResult(_join(lines), links)
+        actions += [
+            search_action("🏢 عناوين أخرى على النطاق", f'"@{domain}"'),
+            Action("🌐 فحص نطاق البريد", "lookup", domain, ("domain",)),
+        ]
+    return LookupResult(_join(lines), actions)
+
+
+# ═══════════════════════════════════════════════════════════
+# 📥 تحميل الملفات لإرسالها داخل تيليجرام
+# ═══════════════════════════════════════════════════════════
+
+_DOWNLOAD_EXTENSIONS = (
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".txt", ".rtf", ".odt", ".ods", ".zip",
+)
+
+
+def downloadable_ext(url: str) -> str | None:
+    """امتداد الملف إذا كان الرابط يشير لملف يمكن إرساله داخل تيليجرام."""
+    path = urlsplit(url).path.lower()
+    return next((ext for ext in _DOWNLOAD_EXTENSIONS if path.endswith(ext)), None)
+
+
+def _safe_filename(url: str) -> str:
+    name = unquote(PurePosixPath(urlsplit(url).path).name) or "document"
+    name = re.sub(r"[^\w.\- ]", "_", name).strip(" .") or "document"
+    return name[-120:]
+
+
+async def _is_public_host(host: str) -> bool:
+    """حماية من الوصول لعناوين داخلية: كل عناوين المضيف يجب أن تكون عامة."""
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None)
+    except OSError:
+        return False
+    return bool(infos) and all(ipaddress.ip_address(str(info[4][0]).split("%")[0]).is_global for info in infos)
+
+
+async def download_file(url: str) -> tuple[bytes, str]:
+    """تحميل ملف من نتيجة بحث (بحد أقصى للحجم ومع منع العناوين الداخلية) لإرساله في المحادثة."""
+    max_bytes = config.MAX_DOWNLOAD_MB * 1024 * 1024
+    for _ in range(5):  # متابعة التحويلات يدوياً مع فحص كل عنوان
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise InvalidInput("❌ رابط الملف غير مدعوم.")
+        if not await _is_public_host(parts.hostname):
+            raise InvalidInput("⛔ لا يمكن تحميل هذا الملف (عنوان غير عام).")
+        async with get_client().stream("GET", url, follow_redirects=False, timeout=30) as resp:
+            if resp.is_redirect and resp.headers.get("location"):
+                url = urljoin(url, resp.headers["location"])
+                continue
+            if resp.status_code != 200:
+                raise InvalidInput(f"❌ تعذّر تحميل الملف (رمز {resp.status_code}).")
+            length = resp.headers.get("content-length", "")
+            if length.isdigit() and int(length) > max_bytes:
+                raise InvalidInput(f"❌ الملف أكبر من {config.MAX_DOWNLOAD_MB} ميغابايت.")
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in resp.aiter_bytes():
+                size += len(chunk)
+                if size > max_bytes:
+                    raise InvalidInput(f"❌ الملف أكبر من {config.MAX_DOWNLOAD_MB} ميغابايت.")
+                chunks.append(chunk)
+            return b"".join(chunks), _safe_filename(url)
+    raise InvalidInput("❌ الرابط يحوّل لعناوين كثيرة جداً.")
 
 
 # ═══════════════════════════════════════════════════════════
