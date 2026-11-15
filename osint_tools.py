@@ -34,7 +34,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape, unescape
 from pathlib import PurePosixPath
 from typing import Any, TypeVar
@@ -90,6 +90,7 @@ class LookupResult:
 
     text: str
     actions: list[Action] = field(default_factory=list)
+    autorun: Action | None = None  # إجراء يُنفَّذ تلقائياً بعد عرض التقرير (مثل Dork مخصص)
 
 
 def url_action(label: str, url: str, *, wide: bool = False) -> Action:
@@ -432,14 +433,19 @@ async def web_search(query: str) -> SearchOutcome:
 _NUM_EMOJI = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟")
 
 NO_SEARCH_KEY_TEXT = (
-    "⚠️ <b>لم أحصل على نتائج.</b>\n"
-    "محركات البحث تحجب البحث المجاني القادم من الخوادم، لذلك يحتاج البحث داخل تيليجرام "
-    "إلى مفتاح مجاني من <b>serper.dev</b> (2,500 بحث مجاني بدون بطاقة بنكية).\n"
-    "أضفه في GitHub كسرّ باسم <code>SERPER_API_KEY</code> وسيعمل البحث تلقائياً."
+    "⚠️ <b>البحث داخل تيليجرام غير مفعّل بعد.</b>\n"
+    "محركات البحث تمنع البحث المجاني القادم من الخوادم، لذلك يحتاج البوت مفتاحاً مجانياً (مرة واحدة فقط):\n"
+    "1️⃣ سجّل في <b>serper.dev</b> وانسخ <b>API Key</b> (2,500 بحث مجاناً بدون بطاقة)\n"
+    "2️⃣ أضفه في GitHub ← Settings ← Secrets and variables ← Actions باسم <code>SERPER_API_KEY</code>\n"
+    "3️⃣ من تبويب Actions اضغط <b>Run workflow</b> — وبعدها كل النتائج تظهر هنا."
 )
 
+NO_SEARCH_USER_TEXT = "⚠️ البحث داخل تيليجرام غير متاح حالياً — حاول لاحقاً."
 
-def format_search_page(title: str, query: str, outcome: SearchOutcome, page: int) -> SearchPage:
+
+def format_search_page(
+    title: str, query: str, outcome: SearchOutcome, page: int, *, show_setup_hint: bool = True
+) -> SearchPage:
     """تنسيق صفحة من نتائج البحث كنص HTML داخل تيليجرام."""
     per_page = max(1, config.SEARCH_RESULTS_PER_PAGE)
     items = outcome.items
@@ -451,7 +457,7 @@ def format_search_page(title: str, query: str, outcome: SearchOutcome, page: int
     lines = [f"🔎 <b>{esc(title)}</b>", f"<code>{esc(_short(query, 200))}</code>", ""]
     if not items:
         if outcome.error == "no_key":
-            lines.append(NO_SEARCH_KEY_TEXT)
+            lines.append(NO_SEARCH_KEY_TEXT if show_setup_hint else NO_SEARCH_USER_TEXT)
         elif outcome.error:
             lines.append("⚠️ تعذّر الاتصال بمحرك البحث حالياً (قد يكون رصيد المفتاح انتهى) — حاول لاحقاً.")
         else:
@@ -1804,10 +1810,116 @@ async def download_file(url: str) -> tuple[bytes, str]:
 
 
 # ═══════════════════════════════════════════════════════════
+# 8️⃣ 🔎 Google Dorks — قائمة خيارات جاهزة والنتائج داخل تيليجرام
+# ═══════════════════════════════════════════════════════════
+
+_GOV_SITES = "(site:.gov OR site:gov.sa OR site:gov.ae OR site:gov.kw OR site:gov.qa OR site:gov.eg)"
+_EDU_SITES = "(site:.edu OR site:edu.sa OR site:ac.ae OR site:ac.uk OR site:researchgate.net)"
+_SOCIAL_SITES = "(site:x.com OR site:instagram.com OR site:tiktok.com OR site:facebook.com OR site:snapchat.com)"
+_NEWS_SITES = "(site:aljazeera.net OR site:alarabiya.net OR site:skynewsarabia.com OR site:bbc.com OR site:cnn.com)"
+
+
+def _one_year_ago() -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
+
+
+async def _looks_like_live_domain(text: str) -> str | None:
+    """هل الإدخال دومين حقيقي؟ (رابط، أو اسم نطاق له سجلات DNS) — لتمييزه عن كلمات مثل john.doe."""
+    site = _extract_site(text)
+    if site:
+        return site
+    if " " in text or "." not in text or is_ip(text):
+        return None
+    try:
+        domain = normalize_domain(text)
+    except InvalidInput:
+        return None
+    has_dns = await _safe(dns_query(domain, "NS"), []) or await _safe(dns_query(domain, "A"), [])
+    return domain if has_dns else None
+
+
+async def dorks_lookup(query: str) -> LookupResult:
+    """قائمة Google Dorks جاهزة حسب نوع الهدف — أو تنفيذ Dork مخصص فوراً."""
+    q = clean_query(query)
+
+    # ✍️ Dork مخصص كتبه المستخدم بنفسه ← ننفّذه مباشرة
+    if '"' in q or _OPERATOR_RE.search(q) or " OR " in q:
+        run = search_action("🔎 نتائج الـ Dork", q, docs="filetype:" in q.lower() or "ext:" in q.lower())
+        text = _join([
+            "✍️ <b>Dork مخصص</b>",
+            f"<code>{esc(q)}</code>",
+            "",
+            "⏳ النتائج في الرسالة التالية 👇",
+        ])
+        return LookupResult(text, [Action("🔁 إعادة البحث", run.kind, run.value, run.extra, wide=True)], autorun=run)
+
+    year_ago = _one_year_ago()
+    domain = await _looks_like_live_domain(q)
+    if domain:
+        kind_text = "🌐 دومين"
+        options = [
+            ("📄 كل الصفحات المفهرسة", f"site:{domain}", False),
+            ("🌿 النطاقات الفرعية", f"site:*.{domain} -site:www.{domain}", False),
+            ("📕 ملفات PDF", f"site:{domain} filetype:pdf", True),
+            ("📗 Excel و CSV", f"site:{domain} (filetype:xls OR filetype:xlsx OR filetype:csv)", True),
+            ("📘 Word و PowerPoint", f"site:{domain} (filetype:doc OR filetype:docx OR filetype:ppt OR filetype:pptx)", True),
+            ("🔑 صفحات الدخول", f"site:{domain} (inurl:login OR inurl:signin OR intitle:login)", False),
+            ("⚙️ لوحات التحكم", f"site:{domain} (inurl:admin OR inurl:dashboard OR intitle:dashboard)", False),
+            ("📁 مجلدات مفتوحة", f'site:{domain} intitle:"index of"', False),
+            ("📧 عناوين البريد", f'"@{domain}"', False),
+            ("🗣️ إشارات خارجية", f'"{domain}" -site:{domain}', False),
+            ("👥 في الشبكات الاجتماعية", f'"{domain}" (site:x.com OR site:linkedin.com OR site:facebook.com)', False),
+            ("💻 في GitHub", f'"{domain}" site:github.com', False),
+            ("📋 في Pastebin", f'"{domain}" site:pastebin.com', False),
+            ("📅 الجديد خلال سنة", f"site:{domain} after:{year_ago}", False),
+        ]
+        target = domain
+    else:
+        kind_text = "🔤 اسم / كلمة بحث"
+        term = phrase(q)
+        options = [
+            ("📕 PDF", f"{term} filetype:pdf", True),
+            ("📘 Word", f"{term} (filetype:doc OR filetype:docx)", True),
+            ("📗 Excel", f"{term} (filetype:xls OR filetype:xlsx)", True),
+            ("📙 PowerPoint", f"{term} (filetype:ppt OR filetype:pptx)", True),
+            ("🏛️ مواقع حكومية", f"{term} {_GOV_SITES}", False),
+            ("🎓 مواقع أكاديمية", f"{term} {_EDU_SITES}", False),
+            ("👥 الشبكات الاجتماعية", f"{term} {_SOCIAL_SITES}", False),
+            ("💼 LinkedIn", f"site:linkedin.com/in {term}", False),
+            ("▶️ YouTube", f"site:youtube.com {term}", False),
+            ("📰 الأخبار", f"{term} {_NEWS_SITES}", False),
+            ("🗣️ منتديات ونقاشات", f"{term} (site:reddit.com OR site:quora.com OR inurl:forum OR inurl:thread)", False),
+            ("💻 GitHub", f"site:github.com {term}", False),
+            ("📋 Pastebin", f"site:pastebin.com {term}", False),
+            ("🗃️ Google Drive", f"{term} (site:docs.google.com OR site:drive.google.com)", False),
+            ("📚 Scribd و SlideShare", f"{term} (site:scribd.com OR site:slideshare.net)", False),
+            ("🔤 في عنوان الصفحة", f"intitle:{term}", False),
+            ("🔗 في رابط الصفحة", f"inurl:{term}", False),
+            ("📅 خلال آخر سنة", f"{term} after:{year_ago}", False),
+        ]
+        target = q
+
+    actions = [search_action(label, dork, docs=docs) for label, dork, docs in options]
+    actions.append(search_action("🔎 بحث عام", phrase(target), wide=True))
+
+    text = _join([
+        "🔎 <b>Google Dorks — بحث متقدم داخل تيليجرام</b>",
+        "",
+        f"🎯 الهدف: <code>{esc(target)}</code>",
+        f"🧩 النوع: {kind_text}",
+        "",
+        f"👇 اختر من <b>{len(actions)}</b> خياراً جاهزاً — النتائج تظهر هنا مباشرة.",
+        "💡 تقدر ترسل Dork جاهز بنفسك، مثل: <code>site:gov.sa \"ميزانية\" filetype:pdf</code>",
+    ])
+    return LookupResult(text, actions)
+
+
+# ═══════════════════════════════════════════════════════════
 # 🚦 الموزّع الرئيسي
 # ═══════════════════════════════════════════════════════════
 
 LOOKUPS: dict[str, Callable[[str], Awaitable[LookupResult]]] = {
+    "dorks": dorks_lookup,
     "social": social_lookup,
     "domain": domain_lookup,
     "ip": ip_lookup,

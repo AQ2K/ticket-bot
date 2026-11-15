@@ -44,6 +44,17 @@ CB_PAGE = "p"  # p:<رمز>:<صفحة> ← التنقل بين صفحات نتا
 # ═══════════════════════════════════════════════════════════
 
 CATEGORIES: dict[str, dict[str, str]] = {
+    "dorks": {
+        "title": "🔎 Google Dorks — بحث داخل تيليجرام",
+        "prompt": (
+            "🔎 <b>Google Dorks — بحث متقدم داخل تيليجرام</b>\n\n"
+            "✍️ أرسل أي هدف:\n"
+            "• اسم أو كلمة، مثل: <code>شركة النور</code>\n"
+            "• دومين، مثل: <code>example.com</code>\n"
+            "• أو Dork جاهز، مثل: <code>site:gov.sa \"ميزانية\" filetype:pdf</code>\n\n"
+            "وسأعرض لك قائمة خيارات بحث جاهزة — والنتائج تظهر هنا داخل تيليجرام 👇"
+        ),
+    },
     "social": {
         "title": "🕵️ بحث متقدم (X / Instagram / TikTok)",
         "prompt": (
@@ -210,21 +221,42 @@ DORKS_CHEATSHEET_TEXT = (
 )
 
 
-def welcome_text(first_name: str) -> str:
+SEARCH_SETUP_HINT = (
+    "\n\n🔧 <b>للمالك فقط:</b> نتائج Google داخل تيليجرام غير مفعّلة بعد — "
+    "أضف مفتاح <code>SERPER_API_KEY</code> المجاني (التفاصيل في /help)."
+)
+
+
+def welcome_text(first_name: str, setup_hint: bool = False) -> str:
     """رسالة الترحيب في القائمة الرئيسية (الاسم يجب أن يكون مُهرَّباً مسبقاً)."""
     greeting = f"مرحباً <b>{first_name}</b> 👋\n" if first_name else "مرحباً 👋\n"
     return (
         "💎 <b>بوت OSINT الشامل - مصادر علنية فقط</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{greeting}"
-        "أداة لجمع المعلومات من المصادر المفتوحة (OSINT) وبناء استعلامات "
-        "Google Dorks بضغطة زر.\n\n"
+        "أداة لجمع المعلومات من المصادر المفتوحة (OSINT) وبحث "
+        "Google Dorks بضغطة زر — وكل النتائج تظهر هنا داخل تيليجرام.\n\n"
         "👇 <b>اختر نوع البحث:</b>\n\n"
         f"{DISCLAIMER}"
+        + (SEARCH_SETUP_HINT if setup_hint else "")
     )
 
 
-def help_text(is_admin: bool) -> str:
+def search_status_text(provider: str | None) -> str:
+    """حالة البحث داخل تيليجرام (تظهر للمالك في /help)."""
+    if provider:
+        return f"\n<b>🔑 البحث داخل تيليجرام:</b> ✅ مفعّل ({provider})\n"
+    return (
+        "\n<b>🔑 البحث داخل تيليجرام:</b> ❌ غير مفعّل\n"
+        "لتفعيله (مرة واحدة فقط، مجاناً):\n"
+        "1️⃣ سجّل في <b>serper.dev</b> وانسخ <b>API Key</b> (2,500 بحث مجاناً بدون بطاقة)\n"
+        "2️⃣ GitHub ← Settings ← Secrets and variables ← Actions ← New repository secret\n"
+        "    الاسم: <code>SERPER_API_KEY</code> والقيمة: المفتاح\n"
+        "3️⃣ تبويب Actions ← 🤖 تشغيل بوت OSINT ← <b>Run workflow</b>\n"
+    )
+
+
+def help_text(is_admin: bool, search_provider: str | None = None) -> str:
     """رسالة المساعدة — تُظهر أوامر المالك له فقط."""
     text = (
         "ℹ️ <b>طريقة الاستخدام</b>\n\n"
@@ -242,6 +274,7 @@ def help_text(is_admin: bool) -> str:
             "\n<b>👑 أوامر المالك:</b>\n"
             "/stats — إحصائيات البوت\n"
             "/broadcast — إرسال رسالة جماعية لكل المستخدمين\n"
+            + search_status_text(search_provider)
         )
     return text + f"\n{DISCLAIMER}"
 
@@ -294,6 +327,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     """🏠 القائمة الرئيسية."""
     return InlineKeyboardMarkup(
         [
+            [_cat("dorks")],
             [_cat("social")],
             [_cat("domain"), _cat("ip")],
             [_cat("phone"), _cat("user")],

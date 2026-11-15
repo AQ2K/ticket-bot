@@ -126,6 +126,24 @@ def _first_name(update: Update) -> str:
     return html.escape(user.first_name) if user and user.first_name else ""
 
 
+def _is_admin(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id in config.ADMIN_IDS)
+
+
+def _search_provider() -> str | None:
+    """مزود البحث المفعّل داخل تيليجرام (إن وُجد مفتاح)."""
+    if config.SERPER_API_KEY:
+        return "Serper — Google"
+    if config.BRAVE_API_KEY:
+        return "Brave"
+    return None
+
+
+def _welcome(update: Update) -> str:
+    """رسالة الترحيب — مع تنبيه للمالك إذا لم يُفعَّل البحث داخل تيليجرام بعد."""
+    return kb.welcome_text(_first_name(update), setup_hint=_is_admin(update) and not _search_provider())
+
+
 def _format_duration(seconds: float) -> str:
     """تحويل المدة بالثواني إلى نص عربي مقروء."""
     minutes, _ = divmod(int(seconds), 60)
@@ -217,7 +235,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("category", None)
     await _clear_prompt_keyboard(context, update.effective_chat.id)
     await update.effective_message.reply_text(
-        kb.welcome_text(_first_name(update)), reply_markup=kb.main_menu_keyboard()
+        _welcome(update), reply_markup=kb.main_menu_keyboard()
     )
     return ConversationHandler.END
 
@@ -230,7 +248,7 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     edit = update.callback_query.data == kb.CB_BACK
     if not edit:
         await _clear_prompt_keyboard(context, update.effective_chat.id)
-    await _show(update, context, kb.welcome_text(_first_name(update)), kb.main_menu_keyboard(), edit=edit)
+    await _show(update, context, _welcome(update), kb.main_menu_keyboard(), edit=edit)
     return ConversationHandler.END
 
 
@@ -332,6 +350,18 @@ async def receive_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await status.edit_text(
             result.text + kb.BUTTONS_FALLBACK_NOTE, reply_markup=kb.error_keyboard(category)
         )
+
+    # ▶️ تنفيذ تلقائي (مثل Dork مخصص كتبه المستخدم) — النتائج في رسالة تالية
+    if result.autorun is not None:
+        handler = ACTION_HANDLERS.get(result.autorun.kind)
+        if handler is not None:
+            context.user_data["last_action"] = time.time()
+            try:
+                await handler(update, context, result.autorun)
+            except Exception:  # noqa: BLE001 — لا نسمح لأي خطأ بإيقاف المحادثة
+                logger.exception("⚠️ خطأ أثناء التنفيذ التلقائي")
+                with contextlib.suppress(TelegramError):
+                    await _send(update, context, kb.ACTION_ERROR_TEXT)
     return ConversationHandler.END
 
 
@@ -353,7 +383,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """/help — طريقة الاستخدام."""
     _register_user(update, context)
     is_admin = bool(update.effective_user and update.effective_user.id in config.ADMIN_IDS)
-    await update.effective_message.reply_text(kb.help_text(is_admin), reply_markup=kb.home_keyboard())
+    await update.effective_message.reply_text(
+        kb.help_text(is_admin, _search_provider()), reply_markup=kb.home_keyboard()
+    )
 
 
 async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -411,14 +443,17 @@ async def _action_search(update: Update, context: ContextTypes.DEFAULT_TYPE, act
 
 async def _render_search_page(message: Message, user_id: int, token: str, entry: dict, page: int) -> None:
     """عرض صفحة من نتائج البحث مع أزرار التحميل والتنقل."""
-    result = tools.format_search_page(entry["title"], entry["query"], entry["outcome"], page)
+    # إرشادات تفعيل البحث تظهر للمالك فقط، وبقية المستخدمين يرون رسالة مختصرة
+    result = tools.format_search_page(
+        entry["title"], entry["query"], entry["outcome"], page,
+        show_setup_hint=user_id in config.ADMIN_IDS,
+    )
     downloads = []
     if entry["docs"]:
         for number, item in result.items:
             if tools.downloadable_ext(item["url"]):
                 downloads.append((number, ACTIONS.put(user_id, tools.Action("📥", "download", item["url"]))))
-    fallback = tools.google(entry["query"]) if not entry["outcome"].items else None
-    markup = kb.search_page_keyboard(token, result.page, result.pages, downloads, fallback)
+    markup = kb.search_page_keyboard(token, result.page, result.pages, downloads)
     try:
         await message.edit_text(result.text, reply_markup=markup)
     except BadRequest as exc:
