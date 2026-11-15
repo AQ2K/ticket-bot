@@ -91,6 +91,7 @@ class LookupResult:
     text: str
     actions: list[Action] = field(default_factory=list)
     autorun: Action | None = None  # إجراء يُنفَّذ تلقائياً بعد عرض التقرير (مثل Dork مخصص)
+    autorun_needs_key: bool = False  # True ← لا يُنفَّذ تلقائياً إلا إذا كان مفتاح البحث مفعّلاً
 
 
 def url_action(label: str, url: str, *, wide: bool = False) -> Action:
@@ -727,7 +728,8 @@ async def social_lookup(query: str) -> LookupResult:
         _INSIDE_HINT,
         "💡 <i>نصيحة: جرّب الاسم بالعربية والإنجليزية للحصول على نتائج أشمل.</i>",
     ]
-    return LookupResult(_join(lines), actions)
+    # نتائج «كل المنصات» تظهر مباشرة تحت التقرير (عند تفعيل مفتاح البحث)
+    return LookupResult(_join(lines), actions, autorun=actions[4], autorun_needs_key=True)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -809,7 +811,8 @@ async def docs_lookup(query: str) -> LookupResult:
         mode_lines = [f"🔤 كلمة البحث: <code>{esc(q)}</code>"]
 
     lines = [
-        "🔗 <b>وثائق وملفات — بحث Google Dorks</b>",
+        f"📄 <b>وثائق — {esc(site or q)}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
         "",
         *mode_lines,
         "",
@@ -819,7 +822,9 @@ async def docs_lookup(query: str) -> LookupResult:
         _INSIDE_HINT,
         "📥 <i>في نتائج الملفات اضغط زر التحميل ليصلك الملف نفسه هنا.</i>",
     ]
-    return LookupResult(_join(lines), actions)
+    # نتائج «كل أنواع الملفات» تظهر مباشرة تحت التقرير (عند تفعيل مفتاح البحث)
+    first = next(a for a in actions if a.label == "📂 كل أنواع الملفات")
+    return LookupResult(_join(lines), actions, autorun=first, autorun_needs_key=True)
 
 
 def _wayback_line(label: str, snapshot: dict | None) -> str:

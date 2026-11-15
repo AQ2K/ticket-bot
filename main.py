@@ -295,12 +295,45 @@ async def unknown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def receive_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """استقبال نص المستخدم ← تنفيذ البحث ← عرض التقرير مع أزرار الروابط."""
+    """استقبال نص المستخدم بعد اختيار قسم من القائمة ← تنفيذ البحث."""
     message = update.effective_message
     category = context.user_data.get("category")
     if category not in kb.CATEGORIES:
         await message.reply_text(kb.CHOOSE_FIRST_TEXT, reply_markup=kb.main_menu_keyboard())
         return ConversationHandler.END
+    return await _run_category(update, context, category, message.text or "")
+
+
+# ⚡ أوامر مباشرة: «/docs احمد محمد» ينفّذ البحث فوراً بدون المرور بالقائمة
+COMMAND_CATEGORIES: dict[str, str] = {
+    "dork": "dorks", "dorks": "dorks", "docs": "docs", "social": "social", "domain": "domain",
+    "ip": "ip", "phone": "phone", "user": "user", "email": "email",
+}
+
+
+async def category_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """أمر قسم: مع هدف ← بحث فوري، وبدون هدف ← طلب الهدف من المستخدم."""
+    _register_user(update, context)
+    message = update.effective_message
+    parts = (message.text or "").split(maxsplit=1)
+    command = parts[0].lstrip("/").split("@")[0].lower() if parts else ""
+    category = COMMAND_CATEGORIES.get(command)
+    if category is None:
+        return ConversationHandler.END
+    await _clear_prompt_keyboard(context, message.chat_id)
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    if not argument:
+        prompt = await message.reply_text(kb.CATEGORIES[category]["prompt"], reply_markup=kb.back_keyboard())
+        context.user_data["category"] = category
+        context.user_data["prompt_message_id"] = prompt.message_id
+        return WAITING_INPUT
+    return await _run_category(update, context, category, argument)
+
+
+async def _run_category(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str, text: str) -> int:
+    """تنفيذ بحث قسم معيّن وعرض التقرير مع أزرار النتائج داخل تيليجرام."""
+    message = update.effective_message
+    context.user_data["category"] = category
 
     # ⏳ حماية من الإغراق: فترة انتظار بين عمليات البحث
     now = time.time()
@@ -318,9 +351,7 @@ async def receive_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     status = await message.reply_text(kb.SEARCHING_TEXT)
 
     try:
-        result = await asyncio.wait_for(
-            tools.run_lookup(category, message.text or ""), timeout=config.LOOKUP_TIMEOUT
-        )
+        result = await asyncio.wait_for(tools.run_lookup(category, text), timeout=config.LOOKUP_TIMEOUT)
     except tools.InvalidInput as exc:
         # إدخال غير صالح: نبقى في نفس القسم وننتظر إدخالاً جديداً
         context.user_data["last_lookup"] = 0.0
@@ -351,8 +382,9 @@ async def receive_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             result.text + kb.BUTTONS_FALLBACK_NOTE, reply_markup=kb.error_keyboard(category)
         )
 
-    # ▶️ تنفيذ تلقائي (مثل Dork مخصص كتبه المستخدم) — النتائج في رسالة تالية
-    if result.autorun is not None:
+    # ▶️ تنفيذ تلقائي (Dork مخصص، أو نتائج الوثائق مباشرة) — النتائج في رسالة تالية.
+    # البحث التلقائي الاختياري لا يُنفَّذ إلا إذا كان مفتاح البحث مفعّلاً، حتى لا تتكرر رسالة التفعيل.
+    if result.autorun is not None and (not result.autorun_needs_key or _search_provider()):
         handler = ACTION_HANDLERS.get(result.autorun.kind)
         if handler is not None:
             context.user_data["last_action"] = time.time()
@@ -722,7 +754,15 @@ async def post_init(application: Application) -> None:
 
     commands = [
         BotCommand("start", "🏠 القائمة الرئيسية"),
-        BotCommand("help", "ℹ️ المساعدة"),
+        BotCommand("dork", "🔎 Google Dorks — مثال: /dork اسم أو دومين"),
+        BotCommand("docs", "📄 وثائق وملفات — مثال: /docs احمد محمد"),
+        BotCommand("social", "🕵️ X و Instagram و TikTok — مثال: /social @user"),
+        BotCommand("domain", "🌐 فحص دومين — مثال: /domain example.com"),
+        BotCommand("ip", "🌐 فحص IP — مثال: /ip 8.8.8.8"),
+        BotCommand("phone", "📞 تحليل رقم — مثال: /phone +966501234567"),
+        BotCommand("user", "👤 فحص يوزر في +550 موقع — مثال: /user john"),
+        BotCommand("email", "✉️ فحص إيميل وتسريبات — مثال: /email a@b.com"),
+        BotCommand("help", "ℹ️ المساعدة وكل الأوامر"),
         BotCommand("cancel", "❌ إلغاء العملية الحالية"),
     ]
     admin_commands = commands + [
@@ -773,7 +813,10 @@ def build_application() -> Application:
     guide_pattern = rf"^{re.escape(kb.CB_GUIDE)}$"
 
     conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(choose_category, pattern=category_pattern)],
+        entry_points=[
+            CallbackQueryHandler(choose_category, pattern=category_pattern),
+            CommandHandler(list(COMMAND_CATEGORIES), category_command),
+        ],
         states={
             WAITING_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_query),
