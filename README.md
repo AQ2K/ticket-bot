@@ -1,85 +1,195 @@
-![Logo](https://www.seekpng.com/png/full/270-2700588_vip-tickets-for-trixie-delight-u0026-starship-vip.png)
+<div dir="rtl">
 
-<div align="center">
-  
-<br>![Windows](https://github.com/danielkrupinski/Osiris/workflows/Windows/badge.svg?branch=master&event=push)
-[![Downloads](https://img.shields.io/github/downloads/jagrosh/MusicBot/total.svg)](https://discord.gg/9ZrzNkzeN4)
-[![Discord](https://discordapp.com/api/guilds/147698382092238848/widget.png)](https://dsc.gg/dst74)<br>
-[![PayPal](https://img.shields.io/badge/donate-PayPal-104098.svg?style=plastic&logo=PayPal)](https://paypal.me/mrmotchy)
-  
-  </div>
-  
-  # Features
-  * **Watch my YT video & host your [bot 24/7](https://dsc.gg/dst74)**
-- Setup 
-- Open 
-- Close
-- Add
-- Remove
-- Rename
-- Close
-- Reopen
-- Per Server Prefix 
-- Ping Command
+# 💎 OSINT — بوت تيليجرام الشامل (مصادر علنية فقط)
 
-# 💎 Preview
-## This it what the bot looks like...
-![](https://github.com/mrmotchy/stuff/blob/main/Unben55555555555555annt.PNG?raw=true)
+بوت تيليجرام عربي تفاعلي لجمع المعلومات من **المصادر المفتوحة (OSINT)** وبناء استعلامات **Google Dorks** بضغطة زر، مع لوحة أزرار تفاعلية كاملة (Inline Keyboard).
 
-![](https://github.com/mrmotchy/stuff/blob/main/Unben6666666666annt.PNG?raw=true)
+> ✅ لا يحتاج أي مفتاح API مدفوع — يعمل مباشرة بعد التثبيت.
 
-# 🔩 Installation
-## Create [TOKEN](https://discord.com/developers/)
-```
-$ under bot_token
-```
+---
 
-## Create [prefix]()
-```
-$ server prefixes could be -; +; !; ?;...
-```
+## ✨ المميزات
 
-# 💻 Code example
-This is a simple example of code using this package.
+| القسم | ماذا يفعل؟ |
+|---|---|
+| 🕵️ **بحث متقدم (X / Instagram / TikTok)** | يولّد Google Dorks لـ `site:x.com` و `site:instagram.com` و `site:tiktok.com` + روابط مباشرة للحسابات والبحث الحي |
+| 🌐 **دومين** | سجلات DNS (A / AAAA / MX / NS / TXT)، بيانات التسجيل عبر RDAP (بديل WHOIS)، عمر النطاق، الاستضافة + روابط crt.sh و Wayback و VirusTotal و Shodan وغيرها |
+| 🌐 **IP** | الموقع الجغرافي التقريبي، مزود الخدمة، ASN، Reverse DNS، مؤشرات VPN/استضافة، النطاق الشبكي + روابط Shodan و Censys و AbuseIPDB |
+| 📞 **هاتف** | الدولة، نوع الرقم، المشغّل الأصلي، المنطقة الزمنية، الصيغ المختلفة + روابط واتساب وتيليجرام وبحث Google |
+| 👤 **يوزر** | فحص تلقائي لوجود اليوزر على 10 منصات + ملف GitHub العلني + روابط مباشرة لأشهر المنصات و WhatsMyName |
+| 🔗 **رابط/ملف (Docs)** | البحث عن ملفات PDF / Word / Excel / PowerPoint، المواقع الحكومية والأكاديمية، Scholar، Scribd، SlideShare — أو حصر البحث داخل موقع معيّن عند إرسال رابط |
+| ✉️ **إيميل** | نوع المزود (مجاني / مؤقت / خاص)، سجلات MX، حماية SPF و DMARC، صورة Gravatar + روابط Have I Been Pwned و Epieos |
+| 📚 **دليل المصادر** | أشهر أدوات OSINT المجانية + ورقة أوامر Google Dorks بالعربية |
 
-```js
-            id: require('quick.db').fetch(`TicketAdminRole_${message.guild.id}`),
-            allow: ["SEND_MESSAGES", "VIEW_CHANNEL"]
-        }, {
-            id: message.guild.roles.everyone,
-            deny: ["VIEW_CHANNEL"]
-        }]).then(() => {
-            message.channel.send({
-                embed: {
-                    title: '✅ | Done',
-                    description: `${txt} has been added to this ticket`,
-                    color: 0x00D700
-                }
-            }).then(async function(msg) {
-                setTimeout(() => {
-                    msg.delete().catch(err => { return })
-                }, 1000 * 7);
-```
-&
-```js
-                const embed2 = new Discord.MessageEmbed()
-                .setTitle(`Premium Ticket Commands`)
-                .setThumbnail(message.guild.iconURL({ dynamic: true }))
-                .setDescription(`**__Here Are My Commands:__**\n\`setup,\` \`transcript,\` \`rename,\` \`remove,\` \`ping,\` \`open,\` \`close\``)
-                .setColor(`#0x2F3136`)
+**مميزات تقنية:**
+- ⚡ مبني على `python-telegram-bot` الإصدار 22 (غير متزامن async) مع `ConversationHandler`.
+- 👥 يخدم عدة مستخدمين في نفس الوقت (`concurrent_updates`).
+- 🛡️ معالجة كاملة للأخطاء: المدخلات الخاطئة أو بطء المصادر لا توقف البوت أبداً.
+- ⏳ حماية من الإغراق (فترة انتظار بين عمليات البحث).
+- 💾 حفظ تلقائي للمستخدمين والإحصائيات وحالة المحادثات (`PicklePersistence`).
+- 🔢 يدعم الأرقام العربية (١٢٣) والنطاقات العربية تلقائياً.
+- 👑 أوامر خاصة بالمالك: `/stats` و `/broadcast`.
+
+---
+
+## 📁 هيكل المشروع
+
+```text
+OSINT/
+├── main.py            # تشغيل البوت، المعالجات (Handlers)، وتوجيه المحادثات
+├── keyboards.py       # القوائم والأزرار العربية + منشئ أزرار الروابط + نصوص الرسائل
+├── osint_tools.py     # مولّدات Google Dorks ودوال الاستعلام من المصادر العلنية
+├── config.py          # الإعدادات: معرّف المالك، المهلات، فترة الانتظار...
+├── requirements.txt   # المكتبات المطلوبة
+├── .env.example       # قالب ملف الأسرار (انسخه باسم .env)
+└── .gitignore
 ```
 
-<br/>
+---
 
+## 🚀 التثبيت والتشغيل
 
+### 1️⃣ المتطلبات
+- Python **3.10** أو أحدث.
 
-## Installation
+### 2️⃣ تحميل المشروع وتثبيت المكتبات
 
+```bash
+git clone https://github.com/AQ2K/ticket-bot.git OSINT
+cd OSINT
+python -m venv venv
+source venv/bin/activate        # على ويندوز: venv\Scripts\activate
+pip install -r requirements.txt
+```
 
- ### Click [here](https://www.youtube.com/channel/UCmkPzf-eAJsiuCh-5kz4Abw) to watch my YouTube video !
- ![](https://github.com/mrmotchy/stuff/blob/main/Bild_2021-06-14_181143.png?raw=true)
+### 3️⃣ إعداد التوكن 🔑
 
+انسخ ملف القالب ثم ضع توكن البوت بداخله:
 
- ### Click [here](https://dsc.gg/dst74) to join my discord server !
- [![Setup](https://github.com/mrmotchy/stuff/blob/main/adada.gif?raw=true)](https://dsc.gg/dst74)
+```bash
+cp .env.example .env            # على ويندوز: copy .env.example .env
+```
 
+ثم عدّل ملف `.env`:
+
+```env
+BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
+```
+
+> ⚠️ **مهم:** ملف `.env` مستثنى من git ولن يُرفع إلى GitHub — لا تكتب التوكن داخل `config.py` لأن المستودع عام.
+> معرّف المالك `8876599674` مضبوط مسبقاً في `config.py`.
+
+### 4️⃣ التشغيل
+
+```bash
+python main.py
+```
+
+افتح البوت في تيليجرام وأرسل `/start` 🎉
+
+---
+
+## 📱 التشغيل من GitHub مباشرة (بدون كمبيوتر — مناسب للآيفون)
+
+البوت يعمل على خوادم GitHub عبر **GitHub Actions** (الملف `.github/workflows/bot.yml`)، ويمكن إعداده بالكامل من متصفح Safari:
+
+1. **أضف التوكن كسرّ (Secret):**
+   افتح [Settings ← Secrets and variables ← Actions ← New repository secret](https://github.com/AQ2K/ticket-bot/settings/secrets/actions/new)
+   - **Name:** `BOT_TOKEN`
+   - **Secret:** توكن البوت من ‎@BotFather‎
+   ثم اضغط **Add secret**. (السرّ مشفّر ولا يظهر لأحد، حتى في السجلات)
+2. **فعّل GitHub Actions:** افتح تبويب [Actions](https://github.com/AQ2K/ticket-bot/actions) واضغط الزر الأخضر
+   **«I understand my workflows, go ahead and enable them»** (مطلوب لأن المستودع منسوخ Fork).
+3. **شغّل البوت:** يبدأ تلقائياً عند أي تحديث على فرع `main`، أو يدوياً من
+   Actions ← **🤖 تشغيل بوت OSINT** ← **Run workflow**.
+
+**كيف يعمل؟**
+- GitHub يوقف أي تشغيل بعد 6 ساعات، لذلك يعمل البوت 5 ساعات و45 دقيقة ثم يتوقف بأمان،
+  ويكون تشغيل جديد في الانتظار ليستلم فوراً (فجوة أقل من دقيقة، والرسائل خلالها لا تضيع).
+- المستخدمون والإحصائيات تُحفظ بين التشغيلات تلقائياً (GitHub Actions Cache).
+- لتطبيق تحديث جديد فوراً: ألغِ التشغيل الحالي من تبويب Actions وسيبدأ التشغيل المنتظر بالكود الجديد.
+
+> ⚠️ **ملاحظات:**
+> - GitHub يوقف الجدولة تلقائياً إذا لم يحدث أي نشاط في المستودع لمدة 60 يوماً — أعد تفعيلها من تبويب Actions.
+> - شروط GitHub تنص على أن Actions مخصصة لتطوير البرمجيات وليست استضافة دائمة، لذا قد تُوقَف.
+>   للاستضافة الدائمة الموثوقة استخدم سيرفراً (VPS) أو خدمة استضافة.
+> - سجلات Actions علنية في المستودعات العامة (التوكن يُخفى تلقائياً).
+
+---
+
+## 📋 الأوامر
+
+| الأمر | الوصف | الصلاحية |
+|---|---|---|
+| `/start` | القائمة الرئيسية | الجميع |
+| `/help` | طريقة الاستخدام | الجميع |
+| `/cancel` | إلغاء العملية الحالية | الجميع |
+| `/stats` | إحصائيات البوت (المستخدمون، عمليات البحث لكل قسم، مدة التشغيل) | 👑 المالك |
+| `/broadcast نص` | إرسال رسالة لكل المستخدمين — أو بالرد على أي رسالة لإعادة إرسالها كما هي | 👑 المالك |
+
+---
+
+## ⚙️ الإعدادات (`config.py`)
+
+| الإعداد | الافتراضي | الوصف |
+|---|---|---|
+| `OWNER_ID` | `8876599674` | معرّف مالك البوت |
+| `ADMIN_IDS` | المالك فقط | يمكن إضافة مشرفين عبر متغير `ADMIN_IDS` في `.env` |
+| `HTTP_TIMEOUT` | `8` ثوانٍ | مهلة كل طلب للمصادر العلنية |
+| `LOOKUP_TIMEOUT` | `30` ثانية | المهلة القصوى لعملية البحث كاملة |
+| `COOLDOWN_SECONDS` | `3` ثوانٍ | فترة الانتظار بين عمليتي بحث لنفس المستخدم |
+| `MAX_QUERY_LENGTH` | `120` حرفاً | أقصى طول لنص البحث |
+
+---
+
+## 🖥️ التشغيل الدائم على سيرفر (Linux + systemd)
+
+أنشئ الملف `/etc/systemd/system/osint-bot.service`:
+
+```ini
+[Unit]
+Description=OSINT Telegram Bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/OSINT
+ExecStart=/opt/OSINT/venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+ثم:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now osint-bot
+sudo journalctl -u osint-bot -f     # متابعة السجلات
+```
+
+---
+
+## 🌍 المصادر المجانية المستخدمة
+
+| المصدر | الاستخدام |
+|---|---|
+| Cloudflare / Google DNS-over-HTTPS | سجلات DNS |
+| rdap.org | بيانات تسجيل الدومين و IP (بديل WHOIS) |
+| ip-api.com / ipwho.is | الموقع الجغرافي لعناوين IP |
+| Wayback Machine API | لقطات الأرشيف |
+| مكتبة phonenumbers | تحليل أرقام الهواتف (تعمل محلياً بدون إنترنت) |
+| واجهات GitHub و GitLab و Bluesky و Keybase وغيرها | فحص وجود اسم المستخدم |
+| Gravatar | التحقق من وجود صورة علنية للبريد |
+
+> ℹ️ النسخة المجانية من ip-api.com محدودة بـ 45 طلباً في الدقيقة، وواجهة GitHub بـ 60 طلباً في الساعة — عند تجاوزها يعرض البوت «تعذّر التحقق» بدل التوقف.
+
+---
+
+## ⚠️ إخلاء المسؤولية
+
+هذا البوت مخصص **للأغراض القانونية والأخلاقية فقط** (البحث الأمني، التحقق من المعلومات، الصحافة الاستقصائية، حماية الهوية الرقمية).
+يعتمد حصراً على **مصادر علنية** ولا يخترق أي نظام. المستخدم وحده مسؤول عن طريقة استخدامه والالتزام بالقوانين المحلية وشروط استخدام المنصات.
+
+</div>
