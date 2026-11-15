@@ -444,10 +444,81 @@ NO_SEARCH_KEY_TEXT = (
 NO_SEARCH_USER_TEXT = "⚠️ البحث داخل تيليجرام غير متاح حالياً — حاول لاحقاً."
 
 
+SEPARATOR = "━━━━━━━━━━━━━━━━"
+
+# إيموجي لكل موقع ونوع ملف — تجعل النتائج أوضح بنظرة واحدة
+_SITE_ICONS = (
+    ("tiktok.com", "🎵"), ("instagram.com", "📸"), ("x.com", "𝕏"), ("twitter.com", "🐦"),
+    ("facebook.com", "📘"), ("youtube.com", "▶️"), ("youtu.be", "▶️"), ("linkedin.com", "💼"),
+    ("github.com", "💻"), ("pastebin.com", "📋"), ("reddit.com", "👽"), ("snapchat.com", "👻"),
+    ("t.me", "✈️"), ("telegram.me", "✈️"), ("threads.net", "🧵"), ("scribd.com", "📚"),
+    ("slideshare.net", "🖥️"), ("docs.google.com", "🗃️"), ("drive.google.com", "🗃️"),
+    ("wikipedia.org", "📖"), ("researchgate.net", "🎓"), ("academia.edu", "🎓"), ("arxiv.org", "🎓"),
+)
+_EXT_ICONS = {
+    ".pdf": "📕", ".doc": "📘", ".docx": "📘", ".xls": "📗", ".xlsx": "📗", ".csv": "📗",
+    ".ppt": "📙", ".pptx": "📙", ".txt": "🗒️", ".zip": "🗜️",
+}
+
+# استخراج أرقام الحسابات من مقتطفات Google (إنجليزي وعربي)
+_SNIPPET_STATS = (
+    ("👥", "متابع", r"(\d[\d.,]*\s?[KMB]?)\s*(?:Followers|من المتابعين)"),
+    ("➡️", "يتابع", r"(\d[\d.,]*\s?[KMB]?)\s*Following"),
+    ("❤️", "إعجاب", r"(\d[\d.,]*\s?[KMB]?)\s*(?:Likes|من تسجيلات الإعجاب)"),
+    ("🖼️", "منشور", r"(\d[\d.,]*\s?[KMB]?)\s*(?:Posts|من المنشورات)"),
+    ("🎬", "فيديو", r"(\d[\d.,]*\s?[KMB]?)\s*Videos"),
+)
+
+
+def _result_icon(url: str) -> str:
+    parts = urlsplit(url)
+    path, host = parts.path.lower(), (parts.hostname or "").lower()
+    for ext, icon in _EXT_ICONS.items():
+        if path.endswith(ext):
+            return icon
+    for site, icon in _SITE_ICONS:
+        if host == site or host.endswith("." + site):
+            return icon
+    if ".gov" in host:
+        return "🏛️"
+    if ".edu" in host or ".ac." in host:
+        return "🎓"
+    return "🌐"
+
+
+def _display_url(url: str) -> str:
+    """رابط مختصر للعرض: tiktok.com/@user/video/123…"""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").removeprefix("www.")
+    return _short(host + unquote(parts.path.rstrip("/")), 55)
+
+
+def _clean_snippet(text: str) -> str:
+    """تنظيف مقتطفات Google: فصل الجمل الملتصقة وتوحيد المسافات."""
+    text = re.sub(r"\.(?=[؀-ۿA-Z])", ". ", text)
+    text = re.sub(r"(?<=[؀-ۿ])\.(?=\S)", ". ", text)  # «الإعجاب.1766» ← «الإعجاب. 1766»
+    text = re.sub(r"\s*\|\s*", " | ", text)
+    text = re.sub(r"\s*·\s*", " · ", text)
+    return re.sub(r"\s+", " ", text).strip(" .|·")
+
+
+def _snippet_stats(text: str) -> str | None:
+    found = []
+    for icon, label, pattern in _SNIPPET_STATS:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            found.append(f"{icon} {match.group(1).strip()} {label}")
+    return " • ".join(found) if found else None
+
+
+def _has_emoji_prefix(text: str) -> bool:
+    return bool(text) and not text[0].isalnum() and text[0] not in "\"'(@#"
+
+
 def format_search_page(
     title: str, query: str, outcome: SearchOutcome, page: int, *, show_setup_hint: bool = True
 ) -> SearchPage:
-    """تنسيق صفحة من نتائج البحث كنص HTML داخل تيليجرام."""
+    """تنسيق صفحة من نتائج البحث كنص HTML مرتب داخل تيليجرام."""
     per_page = max(1, config.SEARCH_RESULTS_PER_PAGE)
     items = outcome.items
     pages = max(1, math.ceil(len(items) / per_page))
@@ -455,25 +526,44 @@ def format_search_page(
     start = page * per_page
     chunk = list(enumerate(items[start : start + per_page], start=start + 1))
 
-    lines = [f"🔎 <b>{esc(title)}</b>", f"<code>{esc(_short(query, 200))}</code>", ""]
+    heading = title if _has_emoji_prefix(title) else f"🔎 {title}"
+    lines: list[str | None] = [
+        f"<b>{esc(heading)}</b>",
+        SEPARATOR,
+        f"🧭 <code>{esc(_short(query, 200))}</code>",
+    ]
+    if items:
+        lines.append(
+            f"📊 النتائج: <b>{len(items)}</b> • 🌐 {esc(outcome.provider)} • 📄 صفحة <b>{page + 1}</b>/{pages}"
+        )
+    lines.append(SEPARATOR)
+
     if not items:
         if outcome.error == "no_key":
             lines.append(NO_SEARCH_KEY_TEXT if show_setup_hint else NO_SEARCH_USER_TEXT)
         elif outcome.error:
             lines.append("⚠️ تعذّر الاتصال بمحرك البحث حالياً (قد يكون رصيد المفتاح انتهى) — حاول لاحقاً.")
         else:
-            lines.append("📭 لا توجد نتائج لهذا البحث.")
+            lines += [
+                "📭 <b>لا توجد نتائج لهذا البحث.</b>",
+                "💡 جرّب خياراً آخر من الأزرار، أو اكتب الاسم بطريقة مختلفة (عربي / إنجليزي).",
+            ]
+
     for number, item in chunk:
-        host = urlsplit(item["url"]).hostname or ""
         badge = _NUM_EMOJI[number - 1] if number <= len(_NUM_EMOJI) else f"{number}."
-        title_text = esc(_short(item["title"] or host, 90))
-        lines.append(f'{badge} <b><a href="{esc_attr(item["url"])}">{title_text}</a></b>')
-        lines.append(f"🌐 <i>{esc(host)}</i>")
-        if item["snippet"]:
-            lines.append(esc(_short(item["snippet"], 230)))
-        lines.append("")
+        title_text = esc(_short(item["title"] or _display_url(item["url"]), 90))
+        snippet = _clean_snippet(item["snippet"]) if item["snippet"] else ""
+        stats = _snippet_stats(f"{item['title']} {item['snippet']}")
+        lines += [
+            "",
+            f'{badge} {_result_icon(item["url"])} <b><a href="{esc_attr(item["url"])}">{title_text}</a></b>',
+            f"🔗 <i>{esc(_display_url(item['url']))}</i>",
+            f"📝 {esc(_short(snippet, 220))}" if snippet else None,
+            stats,
+        ]
+
     if items:
-        lines.append(f"📄 صفحة {page + 1} من {pages} • {len(items)} نتيجة • المصدر: {esc(outcome.provider)}")
+        lines += ["", SEPARATOR, "👆 اضغط على العنوان لفتح الصفحة"]
     return SearchPage(_join(lines).strip(), page, pages, chunk)
 
 

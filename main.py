@@ -30,6 +30,7 @@ from typing import Any
 from telegram import (
     BotCommand,
     BotCommandScopeChat,
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
@@ -444,7 +445,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _register_user(update, context)
     is_admin = bool(update.effective_user and update.effective_user.id in config.ADMIN_IDS)
     await update.effective_message.reply_text(
-        kb.help_text(is_admin, _search_provider()), reply_markup=kb.home_keyboard()
+        kb.help_text(is_admin, _search_provider(), bool(config.INSTAGRAM_SESSIONID)), reply_markup=kb.home_keyboard()
     )
 
 
@@ -665,7 +666,11 @@ async def _action_download(update: Update, context: ContextTypes.DEFAULT_TYPE, a
 
 
 async def _send_single_media(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, item: media.MediaItem, caption: str | None
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    item: media.MediaItem,
+    caption: str | None,
+    markup: InlineKeyboardMarkup | None = None,
 ) -> bool:
     """إرسال مقطع أو صورة واحدة: ملف محلي، أو رابط يحمّله تيليجرام، أو نحمّله نحن ثم نرفعه."""
     try:
@@ -677,15 +682,19 @@ async def _send_single_media(
                 await context.bot.send_video(
                     chat_id, data, filename=filename, caption=caption, supports_streaming=True,
                     duration=item.duration, width=item.width, height=item.height, thumbnail=thumbnail,
-                    **_UPLOAD_TIMEOUTS,
+                    reply_markup=markup, **_UPLOAD_TIMEOUTS,
                 )
             else:
-                await context.bot.send_photo(chat_id, data, filename=filename, caption=caption, **_UPLOAD_TIMEOUTS)
+                await context.bot.send_photo(
+                    chat_id, data, filename=filename, caption=caption, reply_markup=markup, **_UPLOAD_TIMEOUTS
+                )
             return True
         if item.kind == "video":
-            await context.bot.send_video(chat_id, item.url, caption=caption, supports_streaming=True, **_UPLOAD_TIMEOUTS)
+            await context.bot.send_video(
+                chat_id, item.url, caption=caption, supports_streaming=True, reply_markup=markup, **_UPLOAD_TIMEOUTS
+            )
         else:
-            await context.bot.send_photo(chat_id, item.url, caption=caption, **_UPLOAD_TIMEOUTS)
+            await context.bot.send_photo(chat_id, item.url, caption=caption, reply_markup=markup, **_UPLOAD_TIMEOUTS)
         return True
     except TelegramError as exc:
         logger.info("📤 تيليجرام لم يقبل الوسائط مباشرة: %s", exc)
@@ -697,22 +706,50 @@ async def _send_single_media(
         if item.kind == "video":
             await context.bot.send_video(
                 chat_id, data, filename=filename if "." in filename else "video.mp4", caption=caption,
-                supports_streaming=True, duration=item.duration, **_UPLOAD_TIMEOUTS,
+                supports_streaming=True, duration=item.duration, reply_markup=markup, **_UPLOAD_TIMEOUTS,
             )
         else:
-            await context.bot.send_photo(chat_id, data, filename="photo.jpg", caption=caption, **_UPLOAD_TIMEOUTS)
+            await context.bot.send_photo(
+                chat_id, data, filename="photo.jpg", caption=caption, reply_markup=markup, **_UPLOAD_TIMEOUTS
+            )
         return True
     except Exception as exc:  # noqa: BLE001 — أخطاء الشبكة أو الرفع
         logger.warning("📤 تعذّر رفع الوسائط: %s", exc.__class__.__name__)
         return False
 
 
+def _audio_markup(update: Update, result: media.MediaResult) -> InlineKeyboardMarkup | None:
+    """زر «🎵 الصوت MP3» تحت المقطع (للمنشورات التي تحتوي فيديو)."""
+    if not result.source_url or not any(i.kind == "video" for i in result.items):
+        return None
+    token = ACTIONS.put(update.effective_user.id, tools.Action("🎵", "audio", result.source_url))
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎵 تحميل الصوت MP3", callback_data=f"{kb.CB_ACTION}:{token}")]])
+
+
+async def _send_post_music(update: Update, context: ContextTypes.DEFAULT_TYPE, result: media.MediaResult) -> None:
+    """🎵 موسيقى منشور صور TikTok تُرسل كملف صوتي بعد الصور."""
+    if not result.audio_url:
+        return
+    try:
+        data, filename = await tools.download_file(result.audio_url, max_mb=30)
+        await context.bot.send_audio(
+            update.effective_chat.id, data, filename=filename if "." in filename else "music.mp3",
+            title=result.audio_title, performer=result.audio_performer, **_UPLOAD_TIMEOUTS,
+        )
+    except Exception as exc:  # noqa: BLE001 — الموسيقى إضافة اختيارية
+        logger.info("🎵 تعذّر إرسال موسيقى المنشور: %s", exc.__class__.__name__)
+
+
 async def _send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, result: media.MediaResult) -> bool:
     """إرسال نتيجة التحميل: مقطع واحد، أو ألبوم (حتى 10 صور/مقاطع)."""
     chat_id = update.effective_chat.id
     items = result.items[:10]
+    markup = _audio_markup(update, result)
     if len(items) == 1:
-        return await _send_single_media(context, chat_id, items[0], result.caption)
+        sent = await _send_single_media(context, chat_id, items[0], result.caption, markup)
+        if sent:
+            await _send_post_music(update, context, result)
+        return sent
     album = []
     for index, item in enumerate(items):
         source = Path(item.path).read_bytes() if item.path else item.url
@@ -724,15 +761,57 @@ async def _send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, result
             ))
         else:
             album.append(InputMediaPhoto(source, caption=caption))
+    sent = False
     try:
         await context.bot.send_media_group(chat_id, album, **_UPLOAD_TIMEOUTS)
-        return True
+        sent = True
     except TelegramError as exc:
         logger.info("📤 تعذّر إرسال الألبوم، سيتم الإرسال واحداً واحداً: %s", exc)
-    sent = False
-    for index, item in enumerate(items):
-        sent = await _send_single_media(context, chat_id, item, result.caption if index == 0 else None) or sent
+        for index, item in enumerate(items):
+            sent = await _send_single_media(context, chat_id, item, result.caption if index == 0 else None) or sent
+    if sent:
+        await _send_post_music(update, context, result)
+        if markup:  # الألبوم لا يقبل أزراراً — نرسل زر الصوت في رسالة صغيرة
+            with contextlib.suppress(TelegramError):
+                await context.bot.send_message(chat_id, "🎵 تبي صوت المقطع؟", reply_markup=markup)
     return sent
+
+
+async def _action_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
+    """🎵 استخراج صوت المنشور كملف MP3 بجودة عالية وإرساله داخل المحادثة."""
+    user_id = update.effective_user.id
+    if user_id in DOWNLOADS_RUNNING:
+        await _send(update, context, kb.MEDIA_BUSY_TEXT)
+        return
+    DOWNLOADS_RUNNING.add(user_id)
+    audio: media.AudioResult | None = None
+    try:
+        status = await _send(update, context, kb.AUDIO_WAIT_TEXT)
+        with contextlib.suppress(TelegramError):
+            await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VOICE)
+        try:
+            async with DOWNLOAD_SLOTS:
+                audio = await asyncio.wait_for(media.extract_audio(action.value), timeout=240)
+        except tools.InvalidInput as exc:
+            await status.edit_text(str(exc))
+            return
+        except asyncio.TimeoutError:
+            await status.edit_text(kb.TIMEOUT_TEXT)
+            return
+        try:
+            await context.bot.send_audio(
+                update.effective_chat.id, Path(audio.path).read_bytes(), filename="audio.mp3",
+                title=audio.title, performer=audio.performer, duration=audio.duration, **_UPLOAD_TIMEOUTS,
+            )
+            with contextlib.suppress(TelegramError):
+                await status.delete()
+        except TelegramError as exc:
+            logger.warning("🎵 تعذّر إرسال الصوت: %s", exc)
+            await status.edit_text(kb.AUDIO_FAILED_TEXT)
+    finally:
+        DOWNLOADS_RUNNING.discard(user_id)
+        if audio is not None:
+            audio.cleanup()
 
 
 async def _action_media(update: Update, context: ContextTypes.DEFAULT_TYPE, action: tools.Action) -> None:
@@ -779,6 +858,7 @@ async def _action_tt_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 ACTION_HANDLERS: dict[str, ActionHandler] = {
     "media": _action_media,
+    "audio": _action_audio,
     "tt_videos": _action_tt_videos,
     "search": _action_search,
     "subdomains": _action_subdomains,
@@ -902,7 +982,6 @@ async def post_init(application: Application) -> None:
 
     commands = [
         BotCommand("start", "🏠 القائمة الرئيسية"),
-        BotCommand("dl", "📥 تحميل مقطع من TikTok / Instagram / X — أرسل الرابط"),
         BotCommand("tiktok", "🎵 معلومات حساب TikTok — مثال: /tiktok khaby.lame"),
         BotCommand("insta", "📸 معلومات حساب Instagram — مثال: /insta instagram"),
         BotCommand("x", "𝕏 معلومات حساب X — مثال: /x NASA"),

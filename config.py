@@ -64,6 +64,10 @@ BRAVE_API_KEY: str = os.getenv("BRAVE_API_KEY", "").strip()
 # عدد نتائج البحث في كل صفحة داخل تيليجرام
 SEARCH_RESULTS_PER_PAGE: int = 5
 
+# 📖 (اختياري) كوكي جلسة Instagram لتحميل الستوريات ومعلومات حسابات Instagram بدقة.
+# استخدم حساباً ثانوياً — لا تستخدم حسابك الأساسي. يُضاف كسرّ باسم INSTAGRAM_SESSIONID.
+INSTAGRAM_SESSIONID: str = os.getenv("INSTAGRAM_SESSIONID", "").strip()
+
 # ═══════════════════════════════════════════════════════════
 # 🛠️ إعدادات التشغيل
 # ═══════════════════════════════════════════════════════════

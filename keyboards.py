@@ -226,11 +226,15 @@ MEDIA_BUSY_TEXT = "⏳ لديك تحميل قيد التنفيذ بالفعل �
 
 MEDIA_SEND_FAILED_TEXT = "⚠️ تم التحميل لكن تعذّر إرسال المقطع داخل تيليجرام (قد يكون الحجم كبيراً)."
 
+AUDIO_WAIT_TEXT = "🎵 <b>جاري استخراج الصوت بجودة عالية...</b>"
+
+AUDIO_FAILED_TEXT = "⚠️ تعذّر إرسال الملف الصوتي حالياً."
+
 TT_VIDEOS_WAIT_TEXT = "🎬 <b>جاري جلب آخر الفيديوهات...</b>"
 
 
 def searching_web_text(title: str) -> str:
-    return f"🔎 <b>جاري البحث: {title}</b>\nستظهر النتائج هنا خلال ثوانٍ..."
+    return f"⏳ <b>جاري البحث:</b> {title}\nستظهر النتائج هنا خلال ثوانٍ..."
 
 
 def wmn_progress_text(username: str, done: int, total: int) -> str:
@@ -303,7 +307,7 @@ def welcome_text(first_name: str, setup_hint: bool = False) -> str:
         f"{greeting}"
         "أداة لجمع المعلومات من المصادر المفتوحة (OSINT) وبحث "
         "Google Dorks بضغطة زر — وكل النتائج تظهر هنا داخل تيليجرام.\n\n"
-        "📥 <b>أرسل رابط أي مقطع</b> من TikTok أو Instagram أو X وسأحمّله لك فوراً.\n"
+        "📥 <b>أرسل رابط أي مقطع أو صور</b> من TikTok أو Instagram أو X وسأحمّلها لك فوراً — بدون أي قائمة.\n"
         "⚡ <b>أو اكتب أمراً مباشرة</b>، مثل: <code>/tiktok khaby.lame</code> أو <code>/docs احمد محمد</code>\n"
         "(كل الأوامر في /help)\n\n"
         "👇 <b>اختر نوع البحث:</b>\n\n"
@@ -326,7 +330,20 @@ def search_status_text(provider: str | None) -> str:
     )
 
 
-def help_text(is_admin: bool, search_provider: str | None = None) -> str:
+def stories_status_text(enabled: bool) -> str:
+    """حالة تحميل ستوريات Instagram (تظهر للمالك في /help)."""
+    if enabled:
+        return "\n<b>📖 ستوريات Instagram:</b> ✅ مفعّلة\n"
+    return (
+        "\n<b>📖 ستوريات Instagram:</b> ❌ غير مفعّلة (تحتاج جلسة دخول)\n"
+        "لتفعيلها — يُفضّل من كمبيوتر وبحساب Instagram <b>ثانوي</b>:\n"
+        "1️⃣ سجّل الدخول في instagram.com من المتصفح\n"
+        "2️⃣ افتح أدوات المطوّر (F12) ← Application ← Cookies ← instagram.com وانسخ قيمة <code>sessionid</code>\n"
+        "3️⃣ أضفها في GitHub ← Secrets باسم <code>INSTAGRAM_SESSIONID</code> ثم Run workflow\n"
+    )
+
+
+def help_text(is_admin: bool, search_provider: str | None = None, stories_enabled: bool = False) -> str:
     """رسالة المساعدة — تُظهر أوامر المالك له فقط."""
     text = (
         "ℹ️ <b>طريقة الاستخدام</b>\n\n"
@@ -334,8 +351,9 @@ def help_text(is_admin: bool, search_provider: str | None = None) -> str:
         "2️⃣ اختر نوع البحث (دومين، IP، هاتف، يوزر...).\n"
         "3️⃣ أرسل الهدف المطلوب (اسم، يوزر، رابط...).\n"
         "4️⃣ ستصلك النتيجة فوراً، وكل زر يعرض نتائجه هنا داخل تيليجرام.\n\n"
+        "📥 <b>التحميل:</b> أرسل رابط أي مقطع أو صور من TikTok / Instagram / X مباشرة وسيصلك فوراً،\n"
+        "وتحت كل مقطع زر 🎵 لتحميل الصوت MP3.\n\n"
         "<b>⚡ أوامر سريعة (اكتب الأمر ثم الهدف في نفس الرسالة):</b>\n"
-        "/dl <code>رابط المقطع</code> — تحميل من TikTok / Instagram / X\n"
         "/tiktok <code>يوزر</code> — معلومات حساب TikTok\n"
         "/insta <code>يوزر</code> — معلومات حساب Instagram\n"
         "/x <code>يوزر</code> — معلومات حساب X\n"
@@ -360,6 +378,7 @@ def help_text(is_admin: bool, search_provider: str | None = None) -> str:
             "/stats — إحصائيات البوت\n"
             "/broadcast — إرسال رسالة جماعية لكل المستخدمين\n"
             + search_status_text(search_provider)
+            + stories_status_text(stories_enabled)
         )
     return text + f"\n{DISCLAIMER}"
 
@@ -413,12 +432,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [_cat("dorks")],
-            [_cat("media"), _cat("accounts")],
-            [Btn("🕵️ البحث المتقدم", callback_data=CB_ADV)],
+            [Btn("🕵️ البحث المتقدم", callback_data=CB_ADV), _cat("accounts")],
             [_cat("domain"), _cat("ip")],
             [_cat("phone"), _cat("user")],
             [_cat("docs"), _cat("email")],
-            [Btn("📚 دليل المصادر", callback_data=CB_GUIDE)],
         ]
     )
 

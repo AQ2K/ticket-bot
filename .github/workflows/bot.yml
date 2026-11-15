@@ -35,6 +35,8 @@ jobs:
       # مفاتيح البحث داخل تيليجرام (اختيارية — اتركها فارغة إن لم تضفها)
       SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
       BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+      # جلسة Instagram لتحميل الستوريات (اختيارية — من حساب ثانوي)
+      INSTAGRAM_SESSIONID: ${{ secrets.INSTAGRAM_SESSIONID }}
       BOT_RUNTIME_SECONDS: "20700" # 5 ساعات و45 دقيقة
       PYTHONUNBUFFERED: "1"
     steps:

@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import config
 from osint_tools import (
     LOOKUPS,
     Action,
@@ -178,7 +179,7 @@ def is_media_post_url(text: str) -> bool:
     if platform == "x":
         return "/status" in url
     if platform == "instagram":
-        return bool(re.search(r"/(?:p|reel|reels|tv)/", url))
+        return bool(re.search(r"/(?:p|reel|reels|tv|stories)/", url))
     return "/video/" in url or "/photo/" in url or bool(re.search(r"//(?:vm|vt)\.tiktok\.com/", url)) or "/t/" in url
 
 
@@ -203,10 +204,26 @@ class MediaResult:
     caption: str
     items: list[MediaItem] = field(default_factory=list)
     tmpdir: str | None = None
+    source_url: str | None = None  # رابط المنشور (لزر «🎵 الصوت MP3»)
+    audio_url: str | None = None  # موسيقى منشور الصور في TikTok (تُرسل كملف صوتي)
+    audio_title: str | None = None
+    audio_performer: str | None = None
 
     def cleanup(self) -> None:
         if self.tmpdir:
             shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+
+@dataclass
+class AudioResult:
+    path: str
+    title: str | None
+    performer: str | None
+    duration: int | None
+    tmpdir: str
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
 def media_lookup_text(platform: str, url: str) -> str:
@@ -242,7 +259,10 @@ async def download_media(url: str) -> MediaResult:
     if platform == "x":
         result = await _x_media(url)
     elif platform == "tiktok":
-        result = await _ytdlp_media(url, "tiktok")
+        result = await _tiktok_media(url)
+    elif "/stories/" in url:
+        match = re.search(r"/stories/([A-Za-z0-9._]+)", url)
+        result = await instagram_stories(match.group(1) if match else "")
     else:
         try:
             result = await _ytdlp_media(url, "instagram")
@@ -251,8 +271,107 @@ async def download_media(url: str) -> MediaResult:
             if not fallback:
                 raise exc
             result = fallback
+    result.source_url = result.source_url or url
     await _prepare_videos(result)
     return result
+
+
+# ── TikTok: مقاطع الفيديو + منشورات الصور (Slideshow) ──────
+
+
+async def _resolve_tiktok_url(url: str) -> str:
+    """الروابط المختصرة (vm.tiktok.com) ← الرابط الكامل للمنشور."""
+    if not re.search(r"//(?:vm|vt)\.tiktok\.com/|tiktok\.com/t/", url):
+        return url
+    try:
+        resp = await get_client().get(url, headers=_BROWSER_HEADERS, timeout=15)
+        return str(resp.url)
+    except Exception:  # noqa: BLE001 — نكمل بالرابط الأصلي
+        return url
+
+
+async def _tiktok_item(url: str) -> dict | None:
+    """بيانات منشور TikTok من صفحته. صفحة /video/ تحتوي بيانات الصور أيضاً بخلاف /photo/."""
+    match = re.search(r"tiktok\.com/@([^/?#]+)/(?:video|photo)/(\d+)", url)
+    if not match:
+        return None
+    page = f"https://www.tiktok.com/@{match.group(1)}/video/{match.group(2)}"
+    resp = await _fetch(page, headers=_BROWSER_HEADERS, timeout=15)
+    if resp is None or resp.status_code != 200:
+        return None
+    found = re.search(r'id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', resp.text, re.DOTALL)
+    if not found:
+        return None
+    try:
+        detail = json.loads(found.group(1))["__DEFAULT_SCOPE__"]["webapp.video-detail"]
+        return detail["itemInfo"]["itemStruct"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+async def _tiktok_media(url: str) -> MediaResult:
+    url = await _resolve_tiktok_url(url)
+    if "/photo/" not in url:
+        try:
+            return await _ytdlp_media(url, "tiktok")
+        except InvalidInput as exc:
+            item = await _safe(_tiktok_item(url), None, timeout=20)
+            if not (item and item.get("imagePost")):
+                raise exc
+            return await _tiktok_photos(item, url)
+    item = await _safe(_tiktok_item(url), None, timeout=20)
+    if not (item and (item.get("imagePost") or {}).get("images")):
+        raise InvalidInput("⚠️ تعذّر جلب صور المنشور — قد يكون محذوفاً أو خاصاً. حاول بعد قليل.")
+    return await _tiktok_photos(item, url)
+
+
+async def _tiktok_photos(item: dict, url: str) -> MediaResult:
+    """تحميل صور منشور TikTok (حتى 10) + موسيقاه، مع كل معلومات المنشور."""
+    tmpdir = tempfile.mkdtemp(prefix="osint_dl_")
+    images = (item.get("imagePost") or {}).get("images") or []
+
+    async def fetch(index: int, image: dict) -> MediaItem | None:
+        for candidate in (image.get("imageURL") or {}).get("urlList") or []:
+            try:
+                data, _ = await download_file(candidate, max_mb=10)
+            except Exception:  # noqa: BLE001 — نجرب الرابط البديل
+                continue
+            path = f"{tmpdir}/photo_{index}.jpg"
+            Path(path).write_bytes(data)
+            return MediaItem("photo", path=path, width=image.get("imageWidth"), height=image.get("imageHeight"))
+        return None
+
+    photos = [p for p in await asyncio.gather(*(fetch(i, img) for i, img in enumerate(images[:10]))) if p]
+    if not photos:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise InvalidInput("⚠️ تعذّر تحميل صور المنشور حالياً — حاول بعد قليل.")
+
+    author = item.get("author") or {}
+    stats = item.get("stats") or {}
+    music = item.get("music") or {}
+    name, handle = author.get("nickname") or "", author.get("uniqueId") or ""
+    head = [f"🎵 TikTok <b>{esc(name)}</b>" + (f" (@{esc(handle)})" if handle and handle != name else "")
+            + (" ✅" if author.get("verified") else "")]
+    when = _when_text(item.get("createTime"))
+    sound = " — ".join(p for p in (music.get("title"), music.get("authorName")) if p)
+    tail = [
+        "━━━━━━━━━━━━",
+        f"📅 النشر: {when}" if when else None,
+        *_stats_block([
+            ("👁", "المشاهدات", stats.get("playCount")), ("❤️", "الإعجابات", stats.get("diggCount")),
+            ("💬", "التعليقات", stats.get("commentCount")), ("🔁", "المشاركات", stats.get("shareCount")),
+            ("🔖", "الحفظ", stats.get("collectCount")),
+        ]),
+        f"🎵 الصوت: {esc(_short(sound, 80))}" if sound else None,
+        f"🖼️ الصور: {len(photos)}" + (f" من {len(images)}" if len(images) > len(photos) else ""),
+        f'🔗 <a href="{esc_attr(url)}">رابط المنشور</a>',
+    ]
+    title = (item.get("imagePost") or {}).get("title") or ""
+    body = f"{title}\n{item.get('desc') or ''}".strip() if title and title not in (item.get("desc") or "") else item.get("desc") or title
+    return MediaResult(
+        _fit_caption(head, body, tail), photos, tmpdir, source_url=url,
+        audio_url=music.get("playUrl") or None, audio_title=music.get("title"), audio_performer=music.get("authorName"),
+    )
 
 
 # ── تجهيز المقاطع لتيليجرام: H.264 + تشغيل فوري + صورة مصغّرة ──
@@ -261,6 +380,7 @@ _FFMPEG = shutil.which("ffmpeg")
 _FFPROBE = shutil.which("ffprobe")
 _LONG_SIDE_1280 = "scale='if(gt(iw,ih),min(1280,iw),-2)':'if(gt(iw,ih),-2,min(1280,ih))'"
 _THUMB_320 = "scale='if(gt(iw,ih),320,-2)':'if(gt(iw,ih),-2,320)'"
+_LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"
 
 
 async def _run(args: list[str], timeout: float) -> tuple[int, bytes]:
@@ -313,14 +433,16 @@ async def _prepare_video(item: MediaItem, tmpdir: str, index: int) -> None:
 
     info = await _probe(item.path)
     output = f"{tmpdir}/ready_{index}.mp4"
+    # 🔊 الصوت: AAC بجودة 192k مع توحيد مستوى الصوت (loudnorm) حتى لا تكون المقاطع خافتة أو مزعجة
+    audio = ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-af", _LOUDNORM]
+    streams = ["-map", "0:v:0", "-map", "0:a:0?"]
     if info.get("codec") and info["codec"] != "h264":
-        args = [_FFMPEG, "-y", "-i", item.path, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-vf", _LONG_SIDE_1280, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart", output]
+        args = [_FFMPEG, "-y", "-i", item.path, *streams, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-vf", _LONG_SIDE_1280, "-pix_fmt", "yuv420p", *audio, "-movflags", "+faststart", output]
         timeout = 240
     else:
-        args = [_FFMPEG, "-y", "-i", item.path, "-c", "copy", "-movflags", "+faststart", output]
-        timeout = 60
+        args = [_FFMPEG, "-y", "-i", item.path, *streams, "-c:v", "copy", *audio, "-movflags", "+faststart", output]
+        timeout = 90
     code, _ = await _run(args, timeout)
     if code == 0 and Path(output).exists() and 0 < Path(output).stat().st_size <= MAX_UPLOAD_BYTES:
         item.path = output
@@ -334,6 +456,105 @@ async def _prepare_video(item: MediaItem, tmpdir: str, index: int) -> None:
                           "-vf", _THUMB_320, "-q:v", "5", thumb], timeout=30)
     if code == 0 and Path(thumb).exists() and Path(thumb).stat().st_size < 200_000:
         item.thumb = thumb
+
+
+async def extract_audio(url: str) -> AudioResult:
+    """🎵 استخراج صوت المنشور كملف MP3 عالي الجودة (موسيقى منشور الصور أو صوت المقطع)."""
+    if not _FFMPEG:
+        raise InvalidInput("⚠️ استخراج الصوت غير متاح على هذا الخادم (ffmpeg غير مثبّت).")
+    result = await download_media(url)
+    tmpdir = tempfile.mkdtemp(prefix="osint_mp3_")
+    try:
+        source = None
+        if result.audio_url:  # منشور صور TikTok: موسيقى المنشور نفسها
+            data, _ = await download_file(result.audio_url, max_mb=30)
+            source = f"{tmpdir}/music.src"
+            Path(source).write_bytes(data)
+        else:
+            video = next((i for i in result.items if i.kind == "video" and i.path), None)
+            source = video.path if video else None
+        if not source:
+            raise InvalidInput("📭 هذا المنشور لا يحتوي على صوت.")
+        output = f"{tmpdir}/audio.mp3"
+        code, _ = await _run([_FFMPEG, "-y", "-i", source, "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
+                              "-ar", "44100", "-af", _LOUDNORM, output], timeout=120)
+        if code != 0 or not Path(output).exists() or Path(output).stat().st_size == 0:
+            raise InvalidInput("📭 تعذّر استخراج الصوت — قد لا يحتوي المنشور على صوت.")
+        probe = await _run([_FFPROBE, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", output], 30)
+        try:
+            duration = int(float(probe[1].decode().strip() or 0)) or None
+        except ValueError:
+            duration = None
+        return AudioResult(output, result.audio_title, result.audio_performer, duration, tmpdir)
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    finally:
+        result.cleanup()
+
+
+# ── 📖 ستوريات Instagram (تتطلب جلسة دخول INSTAGRAM_SESSIONID) ──
+
+STORIES_NEED_LOGIN_TEXT = (
+    "📖 <b>ستوريات Instagram تتطلب تسجيل الدخول</b>\n\n"
+    "Instagram لا يعرض الستوريات للزوار من الخوادم إطلاقاً (كل المواقع المجهولة محجوبة أو تطلب CAPTCHA).\n"
+    "لتفعيلها أضف كوكي الجلسة <code>sessionid</code> من حساب Instagram <b>ثانوي</b> كسرّ في GitHub باسم "
+    "<code>INSTAGRAM_SESSIONID</code> (التفاصيل في /help).\n\n"
+    "🎵 ستوريات TikTok غير متاحة للزوار من خارج التطبيق."
+)
+
+
+def _instagram_session_headers() -> dict:
+    return {
+        **_BROWSER_HEADERS,
+        "x-ig-app-id": "936619743392459",
+        "Cookie": f"sessionid={config.INSTAGRAM_SESSIONID}",
+    }
+
+
+async def instagram_stories(username: str) -> MediaResult:
+    """تحميل ستوريات حساب Instagram الحالية (صور ومقاطع) باستخدام جلسة الدخول المضافة."""
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username or ""):
+        raise InvalidInput("❌ يوزر Instagram غير صالح.")
+    if not config.INSTAGRAM_SESSIONID:
+        raise InvalidInput(STORIES_NEED_LOGIN_TEXT)
+    headers = _instagram_session_headers()
+    profile = await _get_json(
+        "https://www.instagram.com/api/v1/users/web_profile_info/", params={"username": username},
+        headers=headers, timeout=15,
+    )
+    user = ((profile or {}).get("data") or {}).get("user") if isinstance(profile, dict) else None
+    if not isinstance(user, dict) or not user.get("id"):
+        raise InvalidInput("⚠️ تعذّر الوصول للحساب — تأكد من اليوزر، أو أن جلسة INSTAGRAM_SESSIONID ما زالت صالحة.")
+    if user.get("is_private") and not user.get("followed_by_viewer"):
+        raise InvalidInput("🔒 الحساب خاص — لا يمكن تحميل ستورياته إلا إذا كان حساب الجلسة يتابعه.")
+    reels = await _get_json(
+        "https://www.instagram.com/api/v1/feed/reels_media/", params={"reel_ids": user["id"]},
+        headers=headers, timeout=20,
+    )
+    entries = ((((reels or {}).get("reels") or {}).get(str(user["id"])) or {}).get("items") or []) if isinstance(reels, dict) else []
+    if not entries:
+        raise InvalidInput(f"📭 لا توجد ستوريات حالية لـ @{esc(username)} (الستوري يختفي بعد 24 ساعة).")
+
+    items: list[MediaItem] = []
+    for entry in entries[:10]:
+        videos = entry.get("video_versions") or []
+        images = ((entry.get("image_versions2") or {}).get("candidates")) or []
+        if videos and videos[0].get("url"):
+            items.append(MediaItem("video", url=videos[0]["url"], duration=int(entry.get("video_duration") or 0) or None))
+        elif images and images[0].get("url"):
+            items.append(MediaItem("photo", url=images[0]["url"]))
+    if not items:
+        raise InvalidInput("📭 تعذّر قراءة ستوريات الحساب حالياً.")
+    times = [e.get("taken_at") for e in entries[:10] if e.get("taken_at")]
+    caption = _join([
+        f"📖 <b>ستوريات @{esc(username)}</b>" + (f" — {esc(user.get('full_name') or '')}" if user.get("full_name") else ""),
+        "━━━━━━━━━━━━",
+        f"🎞️ العدد: <b>{len(items)}</b>" + (f" من {len(entries)}" if len(entries) > len(items) else ""),
+        f"🕒 أحدث ستوري: {_when_text(max(times))}" if times else None,
+        f'🔗 <a href="https://www.instagram.com/{esc_attr(username)}/">الحساب</a>',
+    ])
+    return MediaResult(caption, items, source_url=f"https://www.instagram.com/stories/{username}/")
 
 
 async def _prepare_videos(result: MediaResult) -> None:
@@ -427,7 +648,8 @@ async def _x_media(url: str) -> MediaResult:
         })
     if not items:
         raise InvalidInput("📭 هذه التغريدة لا تحتوي على فيديو أو صور.")
-    return MediaResult(caption, items[:10])
+    performer = (data or {}).get("tweet", {}).get("author", {}).get("name") if data else None
+    return MediaResult(caption, items[:10], audio_title=f"صوت تغريدة {tweet_id}", audio_performer=performer)
 
 
 def _x_caption(t: dict) -> str:
@@ -542,7 +764,12 @@ async def _ytdlp_media(url: str, platform: str) -> MediaResult:
 
     item = MediaItem("video", path=path, duration=int(info.get("duration") or 0) or None,
                      width=info.get("width"), height=info.get("height"))
-    return MediaResult(_ytdlp_caption(info, platform, url), [item], tmpdir)
+    artists = info.get("artists") or ([info["artist"]] if info.get("artist") else [])
+    return MediaResult(
+        _ytdlp_caption(info, platform, url), [item], tmpdir, source_url=url,
+        audio_title=info.get("track") or _short(str(info.get("description") or info.get("title") or "صوت المقطع"), 60),
+        audio_performer=", ".join(artists) or info.get("channel") or info.get("uploader"),
+    )
 
 
 def _ytdlp_caption(info: dict, platform: str, url: str) -> str:
@@ -820,11 +1047,12 @@ _IG_STATS_RE = re.compile(
 
 
 async def instagram_profile(username: str) -> dict | None:
-    """معلومات حساب Instagram: الواجهة العامة أولاً، ثم نتائج Google (مفتاح Serper) إن حُجبت."""
+    """معلومات حساب Instagram: الواجهة الرسمية (بجلسة الدخول إن وُجدت)، ثم نتائج Google (Serper) إن حُجبت."""
+    headers = _instagram_session_headers() if config.INSTAGRAM_SESSIONID else {**_BROWSER_HEADERS, "x-ig-app-id": "936619743392459"}
     data = await _get_json(
         "https://www.instagram.com/api/v1/users/web_profile_info/",
         params={"username": username},
-        headers={**_BROWSER_HEADERS, "x-ig-app-id": "936619743392459"},
+        headers=headers,
         timeout=15,
     )
     user = ((data or {}).get("data") or {}).get("user") if isinstance(data, dict) else None
@@ -956,6 +1184,11 @@ async def accounts_lookup(query: str, only: str | None = None) -> LookupResult:
             actions.append(Action("🎬 آخر فيديوهات TikTok", "tt_videos", profile["username"]))
         if p == "x" and profile.get("banner"):
             actions.append(Action("🏞️ غلاف X", "photo", str(profile["banner"]), (f"🏞️ غلاف حساب @{profile['username']} على X",)))
+    # 📖 سؤال تحميل ستوريات Instagram
+    if "instagram" in platforms and re.fullmatch(_USERNAME_PATTERNS["instagram"], username):
+        lines += ["", f"📖 <b>تبي أحمّل ستوريات @{esc(username)} على Instagram؟</b> اضغط الزر 👇"]
+        actions.insert(0, Action("📖 نعم، حمّل ستوريات Instagram", "media",
+                                 f"https://www.instagram.com/stories/{username}/", wide=True))
     if re.fullmatch(r"[A-Za-z0-9._-]{2,40}", username):
         actions.append(Action("🧭 فحص اليوزر في +550 موقع", "wmn", username, wide=True))
     lines += ["", "👇 الصور والفيديوهات تُرسل هنا داخل تيليجرام."]
@@ -1034,6 +1267,9 @@ def _platform_dorks(platform: str, query: str, username: str | None) -> list[tup
         if username:
             options += [
                 ("👤 صفحة الحساب", f"site:tiktok.com/@{username}"),
+                ("💬 تعليقات وإشارات الحساب", f'site:tiktok.com "@{username}" -site:tiktok.com/@{username}'),
+                ("🎬 فيديوهات ذُكر فيها", f'site:tiktok.com inurl:video "@{username}" -site:tiktok.com/@{username}'),
+                ("🔁 دويتو وستيتش معه", f'site:tiktok.com "@{username}" (duet OR stitch OR دويتو)'),
                 ("🔗 روابط للحساب خارج TikTok", f'"tiktok.com/@{username}" -site:tiktok.com'),
             ]
         options += [
@@ -1046,6 +1282,9 @@ def _platform_dorks(platform: str, query: str, username: str | None) -> list[tup
         if username:
             options += [
                 ("👤 صفحة الحساب", f"site:instagram.com/{username}"),
+                ("💬 تعليقات وإشارات الحساب", f'site:instagram.com "@{username}" -site:instagram.com/{username}'),
+                ("🏷️ منشورات ذُكر فيها", f'site:instagram.com/p "@{username}"'),
+                ("🎬 ريلز ذُكر فيها", f'site:instagram.com/reel "@{username}"'),
                 ("🔗 روابط للحساب خارج Instagram", f'"instagram.com/{username}" -site:instagram.com'),
             ]
         options += [
@@ -1089,16 +1328,30 @@ async def platform_search_lookup(query: str, platform: str) -> LookupResult:
             actions.append(Action("🎬 آخر الفيديوهات (تحميل)", "tt_videos", username))
     autorun = next(a for a in actions if a.label.startswith("🔎 كل نتائج"))
 
+    likes_note = None
+    if username and platform == "tiktok":
+        likes_note = (
+            "ℹ️ <i>قائمة الفيديوهات التي أعجب بها الحساب خاصة افتراضياً في TikTok ولا يمكن لأي أداة رؤيتها من الخارج "
+            "— لكن «💬 تعليقات وإشارات» و«🎬 فيديوهات ذُكر فيها» تجد ما فهرسه Google.</i>"
+        )
+    elif username and platform == "instagram":
+        likes_note = (
+            "ℹ️ <i>Instagram لا يعرض إعجابات أي حساب للآخرين إطلاقاً — لكن «💬 تعليقات وإشارات» "
+            "و«🏷️ منشورات ذُكر فيها» تجد ما فهرسه Google.</i>"
+        )
+    sep = "━━━━━━━━━━━━━━━━"
     text = _join([
         f"🕵️ <b>البحث المتقدم — {PLATFORM_NAMES[platform]}</b>",
-        "",
+        sep,
         f"🎯 الهدف: <code>{esc(q)}</code>",
         f"🧩 النوع: {'يوزر 👤' if username else 'اسم / كلمة / هاشتاق 🔤'}",
-        "",
-        "<b>🔎 Google Dorks المُولّدة:</b>",
-        *[f"• <code>{esc(dork)}</code>" for _, dork in options[:3]],
-        "",
-        "👇 اختر نوع البحث — النتائج تظهر هنا داخل تيليجرام.",
+        f"🧰 الخيارات: <b>{len(actions)}</b>",
+        sep,
+        "🧠 <b>أمثلة على الـ Dorks:</b>",
+        *[f"▫️ <code>{esc(dork)}</code>" for _, dork in options[:3]],
+        sep,
+        "👇 اختر نوع البحث — النتائج تظهر هنا داخل تيليجرام",
+        likes_note,
     ])
     return LookupResult(text, actions, autorun=autorun, autorun_needs_key=True)
 
