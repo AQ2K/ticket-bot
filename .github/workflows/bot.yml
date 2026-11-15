@@ -16,11 +16,12 @@ on:
   schedule:
     - cron: "17 */2 * * *" # كل ساعتين لضمان وجود تشغيل جاهز في الانتظار
 
-# نسخة واحدة فقط تعمل في أي وقت — النسخة الجديدة تنتظر انتهاء الحالية
-# (تشغيل نسختين بنفس التوكن يسبب تعارضاً في تيليجرام)
+# نسخة واحدة فقط تعمل في أي وقت (تشغيل نسختين بنفس التوكن يسبب تعارضاً في تيليجرام):
+# • التشغيل المجدول ينتظر انتهاء النسخة الحالية ثم يستلم.
+# • التحديث على main أو «Run workflow» يوقف النسخة الحالية فوراً ليعمل الكود الجديد.
 concurrency:
   group: osint-telegram-bot
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
 
 permissions:
   contents: read
@@ -31,6 +32,9 @@ jobs:
     timeout-minutes: 355
     env:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      # مفاتيح البحث داخل تيليجرام (اختيارية — اتركها فارغة إن لم تضفها)
+      SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+      BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
       BOT_RUNTIME_SECONDS: "20700" # 5 ساعات و45 دقيقة
       PYTHONUNBUFFERED: "1"
     steps:

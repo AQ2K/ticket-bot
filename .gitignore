@@ -14,6 +14,10 @@ env/
 data/
 *.pickle
 
+# 🧹 ملفات أدوات الفحص
+.ruff_cache/
+.pytest_cache/
+
 # 🖥️ ملفات المحررات وأنظمة التشغيل
 .vscode/
 .idea/

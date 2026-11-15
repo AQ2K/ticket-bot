@@ -10,12 +10,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup
 
-from osint_tools import Link
+from osint_tools import Action
+
+
+@dataclass(frozen=True)
+class Link:
+    """رابط خارجي ثابت (يُستخدم في دليل المصادر فقط)."""
+
+    label: str
+    url: str
 
 # ═══════════════════════════════════════════════════════════
 # 🔖 بيانات الأزرار (callback_data)
@@ -27,12 +36,56 @@ CB_BACK = "back:main"  # رجوع للقائمة بتعديل نفس الرسا�
 CB_HOME_NEW = "home:new"  # فتح القائمة برسالة جديدة
 CB_GUIDE = "menu:guide"  # دليل المصادر
 CB_GUIDE_DORKS = "guide:dorks"  # ورقة أوامر Google Dorks
+CB_ACTION = "a"  # a:<رمز>        ← تنفيذ إجراء تُعرض نتيجته داخل تيليجرام
+CB_PAGE = "p"  # p:<رمز>:<صفحة> ← التنقل بين صفحات نتائج البحث
 
 # ═══════════════════════════════════════════════════════════
 # 📂 الأقسام
 # ═══════════════════════════════════════════════════════════
 
 CATEGORIES: dict[str, dict[str, str]] = {
+    "dorks": {
+        "title": "🔎 Google Dorks — بحث داخل تيليجرام",
+        "prompt": (
+            "🔎 <b>Google Dorks — بحث متقدم داخل تيليجرام</b>\n\n"
+            "✍️ أرسل أي هدف:\n"
+            "• اسم أو كلمة، مثل: <code>شركة النور</code>\n"
+            "• دومين، مثل: <code>example.com</code>\n"
+            "• أو Dork جاهز، مثل: <code>site:gov.sa \"ميزانية\" filetype:pdf</code>\n\n"
+            "وسأعرض لك قائمة خيارات بحث جاهزة — والنتائج تظهر هنا داخل تيليجرام 👇"
+        ),
+    },
+    "media": {
+        "title": "📥 تحميل مقاطع",
+        "prompt": (
+            "📥 <b>تحميل مقاطع — TikTok / Instagram / X</b>\n\n"
+            "✍️ أرسل رابط المقطع أو المنشور، مثل:\n"
+            "<code>https://www.tiktok.com/@user/video/123...</code>\n\n"
+            "وسأرسل لك المقطع (أو الصور) هنا مع معلوماته: الناشر، المشاهدات، الإعجابات والتاريخ.\n"
+            "💡 تقدر ترسل الرابط مباشرة في أي وقت بدون فتح القائمة."
+        ),
+    },
+    "accounts": {
+        "title": "📊 معلومات حساب",
+        "prompt": (
+            "📊 <b>معلومات حساب — TikTok / Instagram / X</b>\n\n"
+            "✍️ أرسل اليوزر (مثل <code>khaby.lame</code>) أو رابط الحساب.\n\n"
+            "سأعرض: الاسم، النبذة، المتابِعين، المتابَعين، عدد المنشورات، الإعجابات، التوثيق، "
+            "تاريخ الإنشاء — مع صورة الحساب وآخر الفيديوهات داخل تيليجرام."
+        ),
+    },
+    "acc_tiktok": {
+        "title": "🎵 حساب TikTok",
+        "prompt": "🎵 <b>معلومات حساب TikTok</b>\n\n✍️ أرسل اليوزر أو رابط الحساب، مثل: <code>khaby.lame</code>",
+    },
+    "acc_insta": {
+        "title": "📸 حساب Instagram",
+        "prompt": "📸 <b>معلومات حساب Instagram</b>\n\n✍️ أرسل اليوزر أو رابط الحساب، مثل: <code>instagram</code>",
+    },
+    "acc_x": {
+        "title": "𝕏 حساب X",
+        "prompt": "𝕏 <b>معلومات حساب X (تويتر)</b>\n\n✍️ أرسل اليوزر أو رابط الحساب، مثل: <code>NASA</code>",
+    },
     "social": {
         "title": "🕵️ بحث متقدم (X / Instagram / TikTok)",
         "prompt": (
@@ -121,7 +174,48 @@ GENERIC_ERROR_TEXT = (
     "لم يتأثر البوت — حاول مرة أخرى، أو أرسل /start للعودة للقائمة الرئيسية."
 )
 
-BUTTONS_FALLBACK_NOTE = "\n\n⚠️ <i>تعذّر عرض أزرار الروابط لهذه النتيجة.</i>"
+BUTTONS_FALLBACK_NOTE = "\n\n⚠️ <i>تعذّر عرض أزرار هذه النتيجة.</i>"
+
+ACTION_EXPIRED_TEXT = "⌛ انتهت صلاحية هذا الزر (أُعيد تشغيل البوت). ابحث من جديد من القائمة."
+
+SUBDOMAINS_WAIT_TEXT = "🌿 <b>جاري جمع النطاقات الفرعية...</b>\nقد يستغرق ذلك حتى 30 ثانية."
+
+URLSCAN_WAIT_TEXT = "🔬 <b>جاري جلب فحوصات urlscan.io...</b>"
+
+DOWNLOAD_WAIT_TEXT = "📥 <b>جاري تحميل الملف وإرساله...</b>"
+
+DOWNLOAD_FAILED_TEXT = "⚠️ تعذّر إرسال الملف داخل تيليجرام."
+
+PHOTO_FAILED_TEXT = "⚠️ تعذّر إرسال الصورة حالياً."
+
+WMN_BUSY_TEXT = "⏳ لديك فحص شامل قيد التنفيذ بالفعل — انتظر حتى ينتهي."
+
+ACTION_ERROR_TEXT = "⚠️ تعذّر جلب النتائج حالياً — حاول مرة أخرى بعد قليل."
+
+MEDIA_WAIT_TEXT = "📥 <b>جاري تحميل المقطع...</b>\nقد يستغرق ذلك حتى دقيقة حسب حجم المقطع."
+
+MEDIA_BUSY_TEXT = "⏳ لديك تحميل قيد التنفيذ بالفعل — انتظر حتى ينتهي."
+
+MEDIA_SEND_FAILED_TEXT = "⚠️ تم التحميل لكن تعذّر إرسال المقطع داخل تيليجرام (قد يكون الحجم كبيراً)."
+
+TT_VIDEOS_WAIT_TEXT = "🎬 <b>جاري جلب آخر الفيديوهات...</b>"
+
+
+def searching_web_text(title: str) -> str:
+    return f"🔎 <b>جاري البحث: {title}</b>\nستظهر النتائج هنا خلال ثوانٍ..."
+
+
+def wmn_progress_text(username: str, done: int, total: int) -> str:
+    if not total:
+        return f"🧭 <b>جاري تحضير الفحص الشامل لليوزر</b> <code>{username}</code>...\nيستغرق الفحص عادةً من 30 إلى 90 ثانية."
+    percent = int(done * 100 / total)
+    filled = percent // 10
+    bar = "▓" * filled + "░" * (10 - filled)
+    return (
+        f"🧭 <b>جاري فحص اليوزر</b> <code>{username}</code> <b>في {total} موقع...</b>\n\n"
+        f"{bar} {percent}%\n"
+        f"تم فحص <b>{done}</b> من <b>{total}</b>"
+    )
 
 CANCELLED_TEXT = "❌ تم إلغاء العملية الحالية.\n\n👇 اختر نوع البحث من جديد:"
 
@@ -166,29 +260,68 @@ DORKS_CHEATSHEET_TEXT = (
 )
 
 
-def welcome_text(first_name: str) -> str:
+SEARCH_SETUP_HINT = (
+    "\n\n🔧 <b>للمالك فقط:</b> نتائج Google داخل تيليجرام غير مفعّلة بعد — "
+    "أضف مفتاح <code>SERPER_API_KEY</code> المجاني (التفاصيل في /help)."
+)
+
+
+def welcome_text(first_name: str, setup_hint: bool = False) -> str:
     """رسالة الترحيب في القائمة الرئيسية (الاسم يجب أن يكون مُهرَّباً مسبقاً)."""
     greeting = f"مرحباً <b>{first_name}</b> 👋\n" if first_name else "مرحباً 👋\n"
     return (
         "💎 <b>بوت OSINT الشامل - مصادر علنية فقط</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{greeting}"
-        "أداة لجمع المعلومات من المصادر المفتوحة (OSINT) وبناء استعلامات "
-        "Google Dorks بضغطة زر.\n\n"
+        "أداة لجمع المعلومات من المصادر المفتوحة (OSINT) وبحث "
+        "Google Dorks بضغطة زر — وكل النتائج تظهر هنا داخل تيليجرام.\n\n"
+        "📥 <b>أرسل رابط أي مقطع</b> من TikTok أو Instagram أو X وسأحمّله لك فوراً.\n"
+        "⚡ <b>أو اكتب أمراً مباشرة</b>، مثل: <code>/tiktok khaby.lame</code> أو <code>/docs احمد محمد</code>\n"
+        "(كل الأوامر في /help)\n\n"
         "👇 <b>اختر نوع البحث:</b>\n\n"
         f"{DISCLAIMER}"
+        + (SEARCH_SETUP_HINT if setup_hint else "")
     )
 
 
-def help_text(is_admin: bool) -> str:
+def search_status_text(provider: str | None) -> str:
+    """حالة البحث داخل تيليجرام (تظهر للمالك في /help)."""
+    if provider:
+        return f"\n<b>🔑 البحث داخل تيليجرام:</b> ✅ مفعّل ({provider})\n"
+    return (
+        "\n<b>🔑 البحث داخل تيليجرام:</b> ❌ غير مفعّل\n"
+        "لتفعيله (مرة واحدة فقط، مجاناً):\n"
+        "1️⃣ سجّل في <b>serper.dev</b> وانسخ <b>API Key</b> (2,500 بحث مجاناً بدون بطاقة)\n"
+        "2️⃣ GitHub ← Settings ← Secrets and variables ← Actions ← New repository secret\n"
+        "    الاسم: <code>SERPER_API_KEY</code> والقيمة: المفتاح\n"
+        "3️⃣ تبويب Actions ← 🤖 تشغيل بوت OSINT ← <b>Run workflow</b>\n"
+    )
+
+
+def help_text(is_admin: bool, search_provider: str | None = None) -> str:
     """رسالة المساعدة — تُظهر أوامر المالك له فقط."""
     text = (
         "ℹ️ <b>طريقة الاستخدام</b>\n\n"
         "1️⃣ أرسل /start لفتح القائمة الرئيسية.\n"
         "2️⃣ اختر نوع البحث (دومين، IP، هاتف، يوزر...).\n"
         "3️⃣ أرسل الهدف المطلوب (اسم، يوزر، رابط...).\n"
-        "4️⃣ ستصلك النتيجة فوراً مع أزرار روابط تفتح مباشرة في المتصفح.\n\n"
-        "<b>📋 الأوامر المتاحة:</b>\n"
+        "4️⃣ ستصلك النتيجة فوراً، وكل زر يعرض نتائجه هنا داخل تيليجرام.\n\n"
+        "<b>⚡ أوامر سريعة (اكتب الأمر ثم الهدف في نفس الرسالة):</b>\n"
+        "/dl <code>رابط المقطع</code> — تحميل من TikTok / Instagram / X\n"
+        "/tiktok <code>يوزر</code> — معلومات حساب TikTok\n"
+        "/insta <code>يوزر</code> — معلومات حساب Instagram\n"
+        "/x <code>يوزر</code> — معلومات حساب X\n"
+        "/account <code>يوزر</code> — الحساب على المنصات الثلاث معاً\n"
+        "/dork <code>اسم أو دومين</code> — قائمة Google Dorks\n"
+        "/docs <code>احمد محمد</code> — وثائق وملفات\n"
+        "/social <code>@username</code> — X و Instagram و TikTok\n"
+        "/domain <code>example.com</code> — فحص دومين\n"
+        "/ip <code>8.8.8.8</code> — فحص IP\n"
+        "/phone <code>+966501234567</code> — تحليل رقم هاتف\n"
+        "/user <code>john_doe</code> — فحص يوزر في +550 موقع\n"
+        "/email <code>name@example.com</code> — فحص إيميل وتسريبات\n"
+        "💡 اكتب الأمر وحده (مثل /docs) وسأطلب منك الهدف.\n\n"
+        "<b>📋 أوامر عامة:</b>\n"
         "/start — القائمة الرئيسية\n"
         "/help — المساعدة\n"
         "/cancel — إلغاء العملية الحالية\n"
@@ -198,6 +331,7 @@ def help_text(is_admin: bool) -> str:
             "\n<b>👑 أوامر المالك:</b>\n"
             "/stats — إحصائيات البوت\n"
             "/broadcast — إرسال رسالة جماعية لكل المستخدمين\n"
+            + search_status_text(search_provider)
         )
     return text + f"\n{DISCLAIMER}"
 
@@ -250,6 +384,8 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     """🏠 القائمة الرئيسية."""
     return InlineKeyboardMarkup(
         [
+            [_cat("dorks")],
+            [_cat("media"), _cat("accounts")],
             [_cat("social")],
             [_cat("domain"), _cat("ip")],
             [_cat("phone"), _cat("user")],
@@ -277,16 +413,25 @@ def _nav_row(category: str) -> list[Btn]:
     ]
 
 
-def results_keyboard(links: Iterable[Link], category: str, columns: int = 2) -> InlineKeyboardMarkup:
-    """🔗 بناء لوحة أزرار الروابط المباشرة (تفتح في المتصفح) + صف التنقل.
+def results_keyboard(
+    actions: Iterable[Action],
+    category: str,
+    register: Callable[[Action], str],
+    columns: int = 2,
+) -> InlineKeyboardMarkup:
+    """🔘 بناء أزرار التقرير: كل زر يعرض نتيجته داخل تيليجرام (عدا روابط التطبيقات) + صف التنقل.
 
+    register: دالة تحفظ بيانات الإجراء وتُرجع رمزاً قصيراً (callback_data محدود بـ 64 بايت).
     الأزرار العادية تُرتَّب في أعمدة، والأزرار العريضة (wide) تأخذ سطراً كاملاً.
     """
     rows: list[list[Btn]] = []
     pending: list[Btn] = []
-    for link in links:
-        button = Btn(link.label, url=link.url)
-        if link.wide:
+    for action in actions:
+        if action.kind == "url":
+            button = Btn(action.label, url=action.value)
+        else:
+            button = Btn(action.label, callback_data=f"{CB_ACTION}:{register(action)}")
+        if action.wide:
             if pending:
                 rows.append(pending)
                 pending = []
@@ -305,6 +450,34 @@ def results_keyboard(links: Iterable[Link], category: str, columns: int = 2) -> 
 def error_keyboard(category: str) -> InlineKeyboardMarkup:
     """لوحة تظهر عند الخطأ أو انتهاء المهلة: إعادة المحاولة + رجوع."""
     return InlineKeyboardMarkup([_nav_row(category)])
+
+
+def open_link_keyboard(url: str) -> InlineKeyboardMarkup:
+    """زر احتياطي لفتح رابط الملف عند تعذّر إرساله داخل تيليجرام."""
+    return InlineKeyboardMarkup([[Btn("🌐 فتح رابط الملف", url=url)]])
+
+
+def search_page_keyboard(
+    token: str,
+    page: int,
+    pages: int,
+    downloads: list[tuple[int, str]],
+    fallback_url: str | None = None,
+) -> InlineKeyboardMarkup | None:
+    """أزرار صفحة نتائج البحث: تحميل الملفات + التنقل بين الصفحات + بحث Google احتياطي عند الفشل."""
+    rows: list[list[Btn]] = []
+    download_buttons = [Btn(f"📥 {number}", callback_data=f"{CB_ACTION}:{tok}") for number, tok in downloads]
+    rows += [download_buttons[i : i + 5] for i in range(0, len(download_buttons), 5)]
+    nav = []
+    if page > 0:
+        nav.append(Btn("➡️ السابق", callback_data=f"{CB_PAGE}:{token}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(Btn("التالي ⬅️", callback_data=f"{CB_PAGE}:{token}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if fallback_url:
+        rows.append([Btn("🌐 فتح البحث في Google", url=fallback_url)])
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 # روابط دليل المصادر
