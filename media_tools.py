@@ -20,7 +20,7 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +36,12 @@ from osint_tools import (
     _safe,
     _short,
     clean_query,
+    download_file,
     esc,
     esc_attr,
     get_client,
+    phrase,
+    search_action,
     web_search,
 )
 
@@ -93,6 +96,53 @@ def _date_from_ymd(value: Any) -> str | None:
     return f"{text[:4]}-{text[4:6]}-{text[6:8]}" if len(text) == 8 and text.isdigit() else None
 
 
+def _ago(moment: datetime) -> str:
+    """«منذ 3 أيام» / «منذ سنتين»..."""
+    seconds = max(0, int((datetime.now(timezone.utc) - moment).total_seconds()))
+    for limit, size, unit in ((3600, 60, "دقيقة"), (86400, 3600, "ساعة"), (86400 * 30, 86400, "يوم"),
+                              (86400 * 365, 86400 * 30, "شهر"), (10**12, 86400 * 365, "سنة")):
+        if seconds < limit:
+            return f"منذ {max(1, seconds // size)} {unit}"
+    return ""
+
+
+def _when_text(timestamp: Any = None, ymd: Any = None) -> str | None:
+    """تاريخ ووقت النشر: «2026-11-05 • 14:30 UTC (منذ 10 يوم)»."""
+    try:
+        moment = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
+        return f"{moment:%Y-%m-%d} • {moment:%H:%M} UTC ({_ago(moment)})"
+    except (TypeError, ValueError, OSError):
+        date = _date_from_ymd(ymd)
+        if not date:
+            return None
+        return f"{date} ({_ago(datetime.strptime(date, '%Y-%m-%d').replace(tzinfo=timezone.utc))})"
+
+
+def _duration_text(seconds: Any) -> str | None:
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def _stats_block(rows: list[tuple[str, str, Any]]) -> list[str]:
+    """أسطر الإحصائيات: (إيموجي، العنوان، القيمة) — تتجاهل القيم الفارغة."""
+    return [f"{icon} {label}: <b>{esc(fmt_num(value))}</b>" for icon, label, value in rows if fmt_num(value)]
+
+
+def _fit_caption(head: list[str | None], body: str, tail: list[str | None], limit: int = 1000) -> str:
+    """بناء تعليق المقطع ضمن حد تيليجرام (1024 حرفاً) باختصار النص الأوسط عند الحاجة."""
+    fixed = len(_join(head)) + len(_join(tail)) + 4
+    room = max(0, limit - fixed)
+    middle = esc(_short(body, room)) if body and room > 20 else None
+    return _join([*head, middle, *tail])
+
+
 # ═══════════════════════════════════════════════════════════
 # 🔗 التعرف على الروابط
 # ═══════════════════════════════════════════════════════════
@@ -107,6 +157,7 @@ _MEDIA_URL_RES = {
 }
 
 PLATFORM_NAMES = {"tiktok": "🎵 TikTok", "instagram": "📸 Instagram", "x": "𝕏 X (تويتر)"}
+SHORT_NAMES = {"tiktok": "TikTok", "instagram": "Instagram", "x": "X"}
 
 
 def find_media_url(text: str) -> tuple[str, str] | None:
@@ -144,6 +195,7 @@ class MediaItem:
     duration: int | None = None
     width: int | None = None
     height: int | None = None
+    thumb: str | None = None  # صورة مصغّرة للمقطع (تمنع ظهوره متجمداً أو أسود)
 
 
 @dataclass
@@ -182,22 +234,119 @@ async def media_lookup(query: str) -> LookupResult:
 
 
 async def download_media(url: str) -> MediaResult:
-    """تحميل مقطع/صور من الرابط حسب المنصة."""
+    """تحميل مقطع/صور من الرابط حسب المنصة، ثم تجهيز المقاطع لتعمل بسلاسة في تيليجرام."""
     found = find_media_url(url)
     if not found:
         raise InvalidInput("❌ الرابط غير مدعوم — أرسل رابطاً من TikTok أو Instagram أو X.")
     platform, url = found
     if platform == "x":
-        return await _x_media(url)
-    if platform == "tiktok":
-        return await _ytdlp_media(url, "tiktok")
+        result = await _x_media(url)
+    elif platform == "tiktok":
+        result = await _ytdlp_media(url, "tiktok")
+    else:
+        try:
+            result = await _ytdlp_media(url, "instagram")
+        except InvalidInput as exc:
+            fallback = await _instagram_photos(url)
+            if not fallback:
+                raise exc
+            result = fallback
+    await _prepare_videos(result)
+    return result
+
+
+# ── تجهيز المقاطع لتيليجرام: H.264 + تشغيل فوري + صورة مصغّرة ──
+
+_FFMPEG = shutil.which("ffmpeg")
+_FFPROBE = shutil.which("ffprobe")
+_LONG_SIDE_1280 = "scale='if(gt(iw,ih),min(1280,iw),-2)':'if(gt(iw,ih),-2,min(1280,ih))'"
+_THUMB_320 = "scale='if(gt(iw,ih),320,-2)':'if(gt(iw,ih),-2,320)'"
+
+
+async def _run(args: list[str], timeout: float) -> tuple[int, bytes]:
+    """تشغيل أمر خارجي (ffmpeg/ffprobe) بمهلة."""
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+    )
     try:
-        return await _ytdlp_media(url, "instagram")
-    except InvalidInput as exc:
-        photos = await _instagram_photos(url)
-        if photos:
-            return photos
-        raise exc
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, b""
+    return proc.returncode or 0, out
+
+
+async def _probe(path: str) -> dict:
+    """قراءة ترميز الفيديو وأبعاده ومدته عبر ffprobe."""
+    code, out = await _run([
+        _FFPROBE, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,width,height:format=duration", "-of", "json", path,
+    ], timeout=30)
+    if code != 0:
+        return {}
+    try:
+        data = json.loads(out or b"{}")
+    except ValueError:
+        return {}
+    stream = (data.get("streams") or [{}])[0]
+    try:
+        duration = int(float((data.get("format") or {}).get("duration") or 0))
+    except ValueError:
+        duration = 0
+    return {"codec": stream.get("codec_name"), "width": stream.get("width"),
+            "height": stream.get("height"), "duration": duration or None}
+
+
+async def _prepare_video(item: MediaItem, tmpdir: str, index: int) -> None:
+    """تحويل المقطع لملف محلي H.264 يبدأ تشغيله فوراً (faststart) مع صورة مصغّرة وأبعاد صحيحة."""
+    if item.path is None and item.url:
+        try:
+            data, _ = await download_file(item.url, max_mb=49)
+        except Exception as exc:  # noqa: BLE001 — نُبقي الرابط ليحمّله تيليجرام بنفسه
+            logger.info("📥 تعذّر تحميل المقطع محلياً: %s", exc.__class__.__name__)
+            return
+        item.path = f"{tmpdir}/video_{index}.mp4"
+        Path(item.path).write_bytes(data)
+    if not item.path or not (_FFMPEG and _FFPROBE):
+        return
+
+    info = await _probe(item.path)
+    output = f"{tmpdir}/ready_{index}.mp4"
+    if info.get("codec") and info["codec"] != "h264":
+        args = [_FFMPEG, "-y", "-i", item.path, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-vf", _LONG_SIDE_1280, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", output]
+        timeout = 240
+    else:
+        args = [_FFMPEG, "-y", "-i", item.path, "-c", "copy", "-movflags", "+faststart", output]
+        timeout = 60
+    code, _ = await _run(args, timeout)
+    if code == 0 and Path(output).exists() and 0 < Path(output).stat().st_size <= MAX_UPLOAD_BYTES:
+        item.path = output
+        info = await _probe(output)
+    item.width = info.get("width") or item.width
+    item.height = info.get("height") or item.height
+    item.duration = info.get("duration") or item.duration
+
+    thumb = f"{tmpdir}/thumb_{index}.jpg"
+    code, _ = await _run([_FFMPEG, "-y", "-ss", "0.5", "-i", item.path, "-frames:v", "1",
+                          "-vf", _THUMB_320, "-q:v", "5", thumb], timeout=30)
+    if code == 0 and Path(thumb).exists() and Path(thumb).stat().st_size < 200_000:
+        item.thumb = thumb
+
+
+async def _prepare_videos(result: MediaResult) -> None:
+    videos = [i for i in result.items if i.kind == "video"]
+    if not videos:
+        return
+    if result.tmpdir is None:
+        result.tmpdir = tempfile.mkdtemp(prefix="osint_dl_")
+    for index, item in enumerate(videos):
+        try:
+            await _prepare_video(item, result.tmpdir, index)
+        except Exception:  # noqa: BLE001 — فشل التجهيز لا يمنع إرسال المقطع الأصلي
+            logger.exception("⚠️ فشل تجهيز المقطع")
 
 
 # ── X (تويتر) ───────────────────────────────────────────────
@@ -250,11 +399,17 @@ async def _x_media(url: str) -> MediaResult:
                                            width=media.get("width"), height=media.get("height")))
             elif media.get("type") == "photo" and media.get("url"):
                 items.append(MediaItem("photo", url=str(media["url"])))
-        caption = _x_caption(
-            author.get("screen_name"), author.get("name"), tweet.get("text"), tweet.get("likes"),
-            tweet.get("retweets"), tweet.get("replies"), tweet.get("views"),
-            _date_from_ts(tweet.get("created_timestamp")), tweet.get("url") or url,
-        )
+        verification = author.get("verification") or {}
+        caption = _x_caption({
+            "screen_name": author.get("screen_name"), "name": author.get("name"), "text": tweet.get("text"),
+            "verified": verification.get("verified") if isinstance(verification, dict) else None,
+            "followers": author.get("followers"), "timestamp": tweet.get("created_timestamp"),
+            "views": tweet.get("views"), "likes": tweet.get("likes"), "retweets": tweet.get("retweets"),
+            "replies": tweet.get("replies"), "quotes": tweet.get("quotes"), "bookmarks": tweet.get("bookmarks"),
+            "duration": next((i.duration for i in items if i.duration), None),
+            "size": next((f"{i.width}×{i.height}" for i in items if i.width and i.height), None),
+            "url": tweet.get("url") or url,
+        })
     else:
         vx = await _vx_json(f"Twitter/status/{tweet_id}")
         if not vx:
@@ -264,31 +419,39 @@ async def _x_media(url: str) -> MediaResult:
             if media.get("url"):
                 duration = int((media.get("duration_millis") or 0) / 1000) or None
                 items.append(MediaItem(kind, url=str(media["url"]), duration=duration))
-        caption = _x_caption(
-            vx.get("user_screen_name"), vx.get("user_name"), vx.get("text"), vx.get("likes"), vx.get("retweets"),
-            vx.get("replies"), None, _date_from_ts(vx.get("date_epoch")), vx.get("tweetURL") or url,
-        )
+        caption = _x_caption({
+            "screen_name": vx.get("user_screen_name"), "name": vx.get("user_name"), "text": vx.get("text"),
+            "timestamp": vx.get("date_epoch"), "likes": vx.get("likes"), "retweets": vx.get("retweets"),
+            "replies": vx.get("replies"), "duration": next((i.duration for i in items if i.duration), None),
+            "url": vx.get("tweetURL") or url,
+        })
     if not items:
         raise InvalidInput("📭 هذه التغريدة لا تحتوي على فيديو أو صور.")
     return MediaResult(caption, items[:10])
 
 
-def _x_caption(screen_name, name, text, likes, retweets, replies, views, date, url) -> str:
-    stats = " • ".join(
-        part for part in (
-            f"❤️ {fmt_num(likes)}" if fmt_num(likes) else None,
-            f"🔁 {fmt_num(retweets)}" if fmt_num(retweets) else None,
-            f"💬 {fmt_num(replies)}" if fmt_num(replies) else None,
-            f"👁 {fmt_num(views)}" if fmt_num(views) else None,
-        ) if part
-    )
-    return _join([
-        f"𝕏 <b>{esc(name or '')}</b> (@{esc(screen_name or '?')})",
-        esc(_short(str(text or ""), 500)) if text else None,
-        stats or None,
-        f"📅 {date}" if date else None,
-        f'🔗 <a href="{esc_attr(url)}">رابط التغريدة</a>',
-    ])
+def _x_caption(t: dict) -> str:
+    """تعليق تغريدة كامل: الناشر، النص، تاريخ ووقت النشر، وكل الإحصائيات."""
+    badge = " ✅" if t.get("verified") else ""
+    followers = f" • 👥 {esc(fmt_num(t['followers']))} متابع" if fmt_num(t.get("followers")) else ""
+    head = [f"𝕏 <b>{esc(t.get('name') or '')}</b> (@{esc(t.get('screen_name') or '?')}){badge}{followers}"]
+    when = _when_text(t.get("timestamp"))
+    meta = " • ".join(p for p in (
+        f"⏱️ المدة: {_duration_text(t.get('duration'))}" if _duration_text(t.get("duration")) else None,
+        f"📐 {t['size']}" if t.get("size") else None,
+    ) if p)
+    tail = [
+        "━━━━━━━━━━━━",
+        f"📅 النشر: {when}" if when else None,
+        *_stats_block([
+            ("👁", "المشاهدات", t.get("views")), ("❤️", "الإعجابات", t.get("likes")),
+            ("🔁", "إعادة النشر", t.get("retweets")), ("💬", "الردود", t.get("replies")),
+            ("🗨️", "الاقتباسات", t.get("quotes")), ("🔖", "الحفظ", t.get("bookmarks")),
+        ]),
+        meta or None,
+        f'🔗 <a href="{esc_attr(t.get("url") or "")}">رابط التغريدة</a>',
+    ]
+    return _fit_caption(head, str(t.get("text") or ""), tail)
 
 
 # ── TikTok و Instagram عبر yt-dlp ───────────────────────────
@@ -324,9 +487,11 @@ def _ytdlp_download(url: str, tmpdir: str) -> tuple[dict, str | None]:
         "playlist_items": "1",
         "outtmpl": f"{tmpdir}/%(id)s.%(ext)s",
         "restrictfilenames": True,
+        # H.264 أولاً: صيغة H.265 (HEVC) التي يفضّلها TikTok تتجمد صورتها في تيليجرام على أجهزة كثيرة
         "format": (
-            f"best[ext=mp4][filesize<{size}]/best[ext=mp4][filesize_approx<{size}]/"
-            f"best[filesize<{size}]/best[filesize_approx<{size}]/best[ext=mp4]/best"
+            f"best[vcodec^=h264][ext=mp4][filesize<{size}]/best[vcodec^=avc][ext=mp4][filesize<{size}]/"
+            f"best[vcodec^=h264][filesize_approx<{size}]/best[vcodec^=avc][filesize_approx<{size}]/"
+            f"best[ext=mp4][filesize<{size}]/best[filesize<{size}]/best[filesize_approx<{size}]/best[ext=mp4]/best"
         ),
         "max_filesize": MAX_UPLOAD_BYTES,
         "socket_timeout": 20,
@@ -375,32 +540,42 @@ async def _ytdlp_media(url: str, platform: str) -> MediaResult:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise InvalidInput("❌ المقطع أكبر من حد تيليجرام للبوتات (50 ميغابايت).")
 
-    icon = "🎵 TikTok" if platform == "tiktok" else "📸 Instagram"
-    uploader = info.get("uploader") or info.get("channel") or ""
-    handle = str(info.get("uploader_id") or info.get("channel_id") or "")
-    if handle.isdigit():  # TikTok يُرجع معرّفاً رقمياً — لا فائدة من عرضه
-        handle = ""
-    title = info.get("description") or info.get("title") or ""
-    stats = " • ".join(
-        part for part in (
-            f"👁 {fmt_num(info.get('view_count'))}" if fmt_num(info.get("view_count")) else None,
-            f"❤️ {fmt_num(info.get('like_count'))}" if fmt_num(info.get("like_count")) else None,
-            f"💬 {fmt_num(info.get('comment_count'))}" if fmt_num(info.get("comment_count")) else None,
-            f"🔁 {fmt_num(info.get('repost_count'))}" if fmt_num(info.get("repost_count")) else None,
-        ) if part
-    )
-    date = _date_from_ymd(info.get("upload_date"))
-    caption = _join([
-        f"{icon} <b>{esc(uploader)}</b>" + (f" (@{esc(handle)})" if handle and handle != uploader else ""),
-        esc(_short(str(title), 500)) if title else None,
-        stats or None,
-        " • ".join(p for p in (f"📅 {date}" if date else None,
-                               f"⏱️ {int(info['duration'])} ث" if info.get("duration") else None) if p) or None,
-        f'🔗 <a href="{esc_attr(info.get("webpage_url") or url)}">رابط المقطع</a>',
-    ])
     item = MediaItem("video", path=path, duration=int(info.get("duration") or 0) or None,
                      width=info.get("width"), height=info.get("height"))
-    return MediaResult(caption, [item], tmpdir)
+    return MediaResult(_ytdlp_caption(info, platform, url), [item], tmpdir)
+
+
+def _ytdlp_caption(info: dict, platform: str, url: str) -> str:
+    """تعليق مقطع TikTok/Instagram كامل: الناشر، الوصف، تاريخ ووقت النشر، وكل الإحصائيات."""
+    icon = "🎵 TikTok" if platform == "tiktok" else "📸 Instagram"
+    name = info.get("channel") or info.get("uploader") or ""
+    handle = str(info.get("uploader") or info.get("uploader_id") or "")
+    if handle.isdigit() or handle == name:  # TikTok يُرجع أحياناً معرّفاً رقمياً — لا فائدة من عرضه
+        handle = ""
+    followers = f" • 👥 {esc(fmt_num(info['channel_follower_count']))} متابع" if fmt_num(info.get("channel_follower_count")) else ""
+    head = [f"{icon} <b>{esc(name)}</b>" + (f" (@{esc(handle)})" if handle else "") + followers]
+    when = _when_text(info.get("timestamp"), info.get("upload_date"))
+    artists = info.get("artists") or ([info["artist"]] if info.get("artist") else [])
+    track = info.get("track")
+    sound = f"{track} — {', '.join(artists)}" if track and artists else track
+    width, height = info.get("width"), info.get("height")
+    meta = " • ".join(p for p in (
+        f"⏱️ المدة: {_duration_text(info.get('duration'))}" if _duration_text(info.get("duration")) else None,
+        f"📐 {width}×{height}" if width and height else None,
+    ) if p)
+    tail = [
+        "━━━━━━━━━━━━",
+        f"📅 النشر: {when}" if when else None,
+        *_stats_block([
+            ("👁", "المشاهدات", info.get("view_count")), ("❤️", "الإعجابات", info.get("like_count")),
+            ("💬", "التعليقات", info.get("comment_count")), ("🔁", "المشاركات", info.get("repost_count")),
+            ("🔖", "الحفظ", info.get("save_count")),
+        ]),
+        f"🎵 الصوت: {esc(_short(str(sound), 80))}" if sound else None,
+        meta or None,
+        f'🔗 <a href="{esc_attr(info.get("webpage_url") or url)}">رابط المقطع</a>',
+    ]
+    return _fit_caption(head, str(info.get("description") or info.get("title") or ""), tail)
 
 
 async def _instagram_photos(url: str) -> MediaResult | None:
@@ -435,11 +610,49 @@ async def _instagram_photos(url: str) -> MediaResult | None:
         return None
     kinds = {i.kind for i in items}
     label = "مقطع" if kinds == {"video"} else "صور" if kinds == {"photo"} else "وسائط"
+    info = await _safe(_instagram_post_info(shortcode), None, timeout=20)
+    if info:
+        head = [f"📸 <b>{label} Instagram</b> — @{esc(info['user'])}" if info.get("user") else f"📸 <b>{label} Instagram</b>"]
+        tail = [
+            "━━━━━━━━━━━━",
+            f"📅 النشر: {esc(info['date'])}" if info.get("date") else None,
+            f"❤️ الإعجابات: <b>{esc(info['likes'])}</b>" if info.get("likes") else None,
+            f"💬 التعليقات: <b>{esc(info['comments'])}</b>" if info.get("comments") else None,
+            "<i>ℹ️ الإحصائيات من نتائج Google</i>",
+            f'🔗 <a href="{esc_attr(url)}">رابط المنشور</a>',
+        ]
+        return MediaResult(_fit_caption(head, info.get("text") or "", tail), items)
     caption = _join([
         f"📸 <b>{label} منشور Instagram</b>",
         f'🔗 <a href="{esc_attr(url)}">رابط المنشور</a>',
     ])
     return MediaResult(caption, items)
+
+
+_IG_POST_SNIPPET_RE = re.compile(
+    r"([\d.,]+\s*[KMB]?)\s+likes?,\s*([\d.,]+\s*[KMB]?)\s+comments?\s*-\s*([A-Za-z0-9._]+)\s+on\s+"
+    r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s*:?\s*(.*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+async def _instagram_post_info(shortcode: str) -> dict | None:
+    """إحصائيات منشور Instagram من نتائج Google المفهرسة (عند تفعيل مفتاح البحث)."""
+    outcome = await web_search(f'"{shortcode}" site:instagram.com')
+    for item in outcome.items:
+        if shortcode not in item["url"]:
+            continue
+        match = _IG_POST_SNIPPET_RE.search(f"{item['snippet']}")
+        if not match:
+            continue
+        date = match.group(4)
+        try:
+            date = datetime.strptime(re.sub(r"\s+", " ", date), "%B %d, %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+        return {"likes": match.group(1).strip(), "comments": match.group(2).strip(), "user": match.group(3),
+                "date": date, "text": match.group(5).strip().strip('"“”')}
+    return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -473,24 +686,68 @@ def parse_account(text: str) -> tuple[str | None, str]:
     return None, username
 
 
-async def tiktok_profile(username: str) -> dict | None:
-    """معلومات حساب TikTok من صفحة الحساب العامة. يُرجع {'missing': True} إذا لم يوجد."""
+_TIKTOK_NOT_FOUND_CODES = {10202, 10221}  # رموز TikTok المؤكدة لـ «الحساب غير موجود»
+
+
+async def _tiktok_page(username: str) -> tuple[int | None, dict | None]:
+    """قراءة صفحة الحساب ← (رمز الحالة، بيانات الحساب). None = تعذّر القراءة."""
     resp = await _fetch(f"https://www.tiktok.com/@{username}", headers=_BROWSER_HEADERS, timeout=15)
     if resp is None or resp.status_code != 200:
-        return None
+        return None, None
     match = re.search(r'id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', resp.text, re.DOTALL)
     if not match:
-        return None
+        return None, None
     try:
         detail = json.loads(match.group(1))["__DEFAULT_SCOPE__"]["webapp.user-detail"]
     except (ValueError, KeyError, TypeError):
+        return None, None
+    return detail.get("statusCode"), detail
+
+
+async def _tiktok_oembed(username: str) -> dict | bool | None:
+    """تحقق ثانٍ عبر oEmbed الرسمي: dict = موجود، False = غير موجود، None = تعذّر التحقق."""
+    resp = await _fetch(
+        "https://www.tiktok.com/oembed", params={"url": f"https://www.tiktok.com/@{username}"},
+        headers=_BROWSER_HEADERS, timeout=15,
+    )
+    if resp is None:
         return None
-    if detail.get("statusCode") not in (0, None):
+    if resp.status_code == 400:
+        return False
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) and data.get("author_name") else None
+
+
+async def tiktok_profile(username: str) -> dict | None:
+    """معلومات حساب TikTok. لا نقول «غير موجود» إلا إذا أكّد ذلك مصدران مستقلان."""
+    status, detail = await _tiktok_page(username)
+    user = ((detail or {}).get("userInfo") or {}).get("user") or {}
+    stats = ((detail or {}).get("userInfo") or {}).get("stats") or {}
+    if status in (0, None) and user.get("uniqueId"):
+        return _tiktok_full_profile(user, stats)
+
+    # الصفحة لم تُرجع البيانات (حجب مؤقت أو رمز غير معتاد) ← نتحقق عبر oEmbed
+    oembed = await _tiktok_oembed(username)
+    if isinstance(oembed, dict):
+        author_url = str(oembed.get("author_url") or f"https://www.tiktok.com/@{username}")
+        return {
+            "platform": "tiktok",
+            "username": author_url.rstrip("/").rsplit("@", 1)[-1] or username,
+            "name": oembed.get("author_name"),
+            "url": author_url,
+            "partial": True,
+        }
+    if oembed is False and status in _TIKTOK_NOT_FOUND_CODES:
         return {"missing": True}
-    user = (detail.get("userInfo") or {}).get("user") or {}
-    stats = (detail.get("userInfo") or {}).get("stats") or {}
-    if not user.get("uniqueId"):
-        return {"missing": True}
+    return None
+
+
+def _tiktok_full_profile(user: dict, stats: dict) -> dict:
     likes = stats.get("heart") if int(stats.get("heart") or 0) > 0 else stats.get("heartCount")
     bio_link = (user.get("bioLink") or {}).get("link") if isinstance(user.get("bioLink"), dict) else None
     return {
@@ -588,26 +845,48 @@ async def instagram_profile(username: str) -> dict | None:
             "url": f"https://www.instagram.com/{user.get('username') or username}/",
         }
 
-    # احتياطي: نتائج Google المفهرسة لصفحة الحساب
-    outcome = await web_search(f'site:instagram.com "{username}"')
-    for item in outcome.items:
-        path = re.sub(r"^https?://(?:www\.)?instagram\.com", "", item["url"]).strip("/").lower()
-        if path != username.lower():
-            continue
-        stats = _IG_STATS_RE.search(f"{item['snippet']} {item['title']}")
-        name_match = re.match(r"(.+?)\s*\(@", item["title"])
-        return {
-            "platform": "instagram",
-            "username": username,
-            "name": name_match.group(1).strip() if name_match else None,
-            "followers_text": stats.group(1) if stats else None,
-            "following_text": stats.group(2) if stats else None,
-            "posts_text": stats.group(3) if stats else None,
-            "bio": item["snippet"] if not stats else None,
-            "url": f"https://www.instagram.com/{username}/",
-            "source": "google",
-        }
-    return {"blocked": True, "no_key": outcome.error == "no_key"}
+    # احتياطي: نتائج Google المفهرسة لصفحة الحساب (استعلامان لزيادة الدقة)
+    no_key = False
+    seen_profile = None
+    for query in (f"site:instagram.com/{username}", f'site:instagram.com "{username}"'):
+        outcome = await web_search(query)
+        no_key = no_key or outcome.error == "no_key"
+        for item in outcome.items:
+            path = re.sub(r"^https?://(?:www\.)?instagram\.com", "", item["url"]).split("?")[0].strip("/")
+            if path.split("/")[0].lower() != username.lower():
+                continue
+            seen_profile = seen_profile or item
+            stats = _IG_STATS_RE.search(f"{item['snippet']} {item['title']}")
+            if stats or path.lower() == username.lower():
+                return _instagram_from_google(username, item, stats)
+        if outcome.items and seen_profile:
+            break
+    if seen_profile:
+        return _instagram_from_google(username, seen_profile, None)
+    return {"blocked": True, "no_key": no_key}
+
+
+def _instagram_from_google(username: str, item: dict, stats: re.Match | None) -> dict:
+    """بناء ملف حساب Instagram من نتيجة Google (العنوان + المقتطف)."""
+    name_match = re.match(r"(.+?)\s*\(@", item["title"])
+    bio = None
+    if not stats:
+        bio = item["snippet"]
+    else:
+        after = item["snippet"][stats.end():]
+        bio_match = re.search(r"\)\s*[:.-]?\s*(.+)$", after)
+        bio = bio_match.group(1).strip() if bio_match and len(bio_match.group(1).strip()) > 3 else None
+    return {
+        "platform": "instagram",
+        "username": username,
+        "name": name_match.group(1).strip() if name_match else None,
+        "followers_text": stats.group(1).strip() if stats else None,
+        "following_text": stats.group(2).strip() if stats else None,
+        "posts_text": stats.group(3).strip() if stats else None,
+        "bio": bio,
+        "url": f"https://www.instagram.com/{username}/",
+        "source": "google",
+    }
 
 
 _PROFILE_FETCHERS = {"tiktok": tiktok_profile, "instagram": instagram_profile, "x": x_profile}
@@ -619,12 +898,13 @@ def _profile_section(platform: str, username: str, profile: dict | None) -> list
     if not re.fullmatch(_USERNAME_PATTERNS[platform], username):
         return [f"<b>{title}</b>: ➖ <i>صيغة اليوزر غير مدعومة على هذه المنصة</i>"]
     if profile is None:
-        return [f"<b>{title}</b>: ⚠️ <i>تعذّر الاتصال حالياً — حاول بعد قليل</i>"]
+        return [f"<b>{title}</b>: ⚠️ <i>تعذّر التحقق حالياً (المنصة لم تستجب) — حاول بعد قليل</i>"]
     if profile.get("missing"):
-        return [f"<b>{title}</b>: ❌ <i>الحساب غير موجود</i>"]
+        return [f"<b>{title}</b>: ❌ <i>لا يوجد حساب بهذا اليوزر على {SHORT_NAMES[platform]} (تم التأكد من مصدرين)</i>"]
     if profile.get("blocked"):
-        hint = " — فعّل مفتاح البحث (Serper) لعرض بياناته" if profile.get("no_key") else ""
-        return [f"<b>{title}</b>: 🔒 <i>المنصة تحجب الطلبات من الخوادم{hint}</i>"]
+        if profile.get("no_key"):
+            return [f"<b>{title}</b>: 🔒 <i>المنصة تحجب الطلبات من الخوادم — فعّل مفتاح البحث (Serper) لعرض بياناته</i>"]
+        return [f"<b>{title}</b>: ⚠️ <i>لم يظهر الحساب في نتائج Google — قد يكون جديداً أو خاصاً أو اليوزر مكتوب بشكل مختلف</i>"]
 
     badges = ("✅" if profile.get("verified") else "") + (" 🔒" if profile.get("private") else "")
     followers = fmt_num(profile.get("followers")) or profile.get("followers_text")
@@ -646,6 +926,7 @@ def _profile_section(platform: str, username: str, profile: dict | None) -> list
         _kv("📅 تاريخ الإنشاء", profile.get("created")),
         "• 🔒 حساب خاص" if profile.get("private") else None,
         "<i>ℹ️ من نتائج Google — قد لا تكون محدّثة لحظياً</i>" if profile.get("source") == "google" else None,
+        "<i>✅ الحساب موجود — تعذّر جلب الإحصائيات حالياً، حاول بعد قليل</i>" if profile.get("partial") else None,
     ]
     return lines
 
@@ -735,8 +1016,110 @@ async def x_account_lookup(query: str) -> LookupResult:
     return await accounts_lookup(query, only="x")
 
 
+# ═══════════════════════════════════════════════════════════
+# 🕵️ البحث المتقدم: TikTok / Instagram / X — Google Dorks داخل تيليجرام
+# ═══════════════════════════════════════════════════════════
+
+_ACCOUNT_CATEGORY = {"tiktok": "acc_tiktok", "instagram": "acc_insta", "x": "acc_x"}
+_X_SITES = "(site:x.com OR site:twitter.com)"
+
+
+def _platform_dorks(platform: str, query: str, username: str | None) -> list[tuple[str, str]]:
+    """استعلامات Google Dorks خاصة بكل منصة."""
+    term = phrase(username or query)
+    year_ago = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
+    name = SHORT_NAMES[platform]
+    options: list[tuple[str, str]] = []
+    if platform == "tiktok":
+        if username:
+            options += [
+                ("👤 صفحة الحساب", f"site:tiktok.com/@{username}"),
+                ("🔗 روابط للحساب خارج TikTok", f'"tiktok.com/@{username}" -site:tiktok.com'),
+            ]
+        options += [
+            ("🎬 الفيديوهات", f"site:tiktok.com inurl:video {term}"),
+            ("#️⃣ الهاشتاقات", f"site:tiktok.com/tag {term}"),
+            ("🎵 الأصوات", f"site:tiktok.com/music {term}"),
+        ]
+        base = "site:tiktok.com"
+    elif platform == "instagram":
+        if username:
+            options += [
+                ("👤 صفحة الحساب", f"site:instagram.com/{username}"),
+                ("🔗 روابط للحساب خارج Instagram", f'"instagram.com/{username}" -site:instagram.com'),
+            ]
+        options += [
+            ("🖼️ المنشورات", f"site:instagram.com/p {term}"),
+            ("🎬 الريلز", f"site:instagram.com/reel {term}"),
+            ("#️⃣ الهاشتاقات", f"site:instagram.com/explore/tags {term}"),
+            ("📍 الأماكن", f"site:instagram.com/explore/locations {term}"),
+        ]
+        base = "site:instagram.com"
+    else:
+        if username:
+            options += [
+                ("👤 صفحة الحساب", f"site:x.com/{username} OR site:twitter.com/{username}"),
+                (f"💬 إشارات @{username}", f'"@{username}" {_X_SITES}'),
+                ("🔗 روابط للحساب خارج X", f'("x.com/{username}" OR "twitter.com/{username}") -site:x.com -site:twitter.com'),
+            ]
+        tag = re.sub(r"\s+", "", (username or query).lstrip("#"))
+        options += [
+            ("📝 التغريدات", f"{_X_SITES} inurl:status {term}"),
+            ("#️⃣ الهاشتاق", f'{_X_SITES} "#{tag}"'),
+        ]
+        base = _X_SITES
+    options += [
+        (f"🔎 كل نتائج {name}", f"{base} {term}"),
+        ("📅 خلال آخر سنة", f"{base} {term} after:{year_ago}"),
+    ]
+    return options
+
+
+async def platform_search_lookup(query: str, platform: str) -> LookupResult:
+    """البحث المتقدم في منصة واحدة: قائمة Dorks جاهزة + نتائج «كل النتائج» مباشرة."""
+    q = clean_query(query)
+    match = re.fullmatch(r"@?([A-Za-z0-9._]{2,30})", q)
+    username = match.group(1) if match and re.fullmatch(_USERNAME_PATTERNS[platform], match.group(1)) else None
+    options = _platform_dorks(platform, q, username)
+
+    actions = [search_action(label, dork) for label, dork in options]
+    if username:
+        actions.append(Action("📊 معلومات الحساب", "lookup", username, (_ACCOUNT_CATEGORY[platform],)))
+        if platform == "tiktok":
+            actions.append(Action("🎬 آخر الفيديوهات (تحميل)", "tt_videos", username))
+    autorun = next(a for a in actions if a.label.startswith("🔎 كل نتائج"))
+
+    text = _join([
+        f"🕵️ <b>البحث المتقدم — {PLATFORM_NAMES[platform]}</b>",
+        "",
+        f"🎯 الهدف: <code>{esc(q)}</code>",
+        f"🧩 النوع: {'يوزر 👤' if username else 'اسم / كلمة / هاشتاق 🔤'}",
+        "",
+        "<b>🔎 Google Dorks المُولّدة:</b>",
+        *[f"• <code>{esc(dork)}</code>" for _, dork in options[:3]],
+        "",
+        "👇 اختر نوع البحث — النتائج تظهر هنا داخل تيليجرام.",
+    ])
+    return LookupResult(text, actions, autorun=autorun, autorun_needs_key=True)
+
+
+async def adv_tiktok_lookup(query: str) -> LookupResult:
+    return await platform_search_lookup(query, "tiktok")
+
+
+async def adv_instagram_lookup(query: str) -> LookupResult:
+    return await platform_search_lookup(query, "instagram")
+
+
+async def adv_x_lookup(query: str) -> LookupResult:
+    return await platform_search_lookup(query, "x")
+
+
 # تسجيل الأقسام الجديدة في الموزّع الرئيسي
 LOOKUPS.update({
+    "adv_tiktok": adv_tiktok_lookup,
+    "adv_insta": adv_instagram_lookup,
+    "adv_x": adv_x_lookup,
     "media": media_lookup,
     "accounts": accounts_lookup,
     "acc_tiktok": tiktok_account_lookup,

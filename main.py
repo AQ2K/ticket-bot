@@ -294,6 +294,14 @@ async def show_guide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def show_adv_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """🕵️ البحث المتقدم ← اختيار المنصة: TikTok / Instagram / تويتر."""
+    await _answer(update)
+    context.user_data.pop("category", None)
+    await _show(update, context, kb.ADV_MENU_TEXT, kb.adv_menu_keyboard())
+    return ConversationHandler.END
+
+
 async def show_dorks_cheatsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """📝 ورقة أوامر Google Dorks."""
     await _answer(update)
@@ -664,9 +672,12 @@ async def _send_single_media(
         if item.path:
             data, filename = Path(item.path).read_bytes(), Path(item.path).name
             if item.kind == "video":
+                # الأبعاد والمدة والصورة المصغّرة تمنع ظهور المقطع متجمداً أو بمقاس خاطئ
+                thumbnail = Path(item.thumb).read_bytes() if item.thumb else None
                 await context.bot.send_video(
                     chat_id, data, filename=filename, caption=caption, supports_streaming=True,
-                    duration=item.duration, width=item.width, height=item.height, **_UPLOAD_TIMEOUTS,
+                    duration=item.duration, width=item.width, height=item.height, thumbnail=thumbnail,
+                    **_UPLOAD_TIMEOUTS,
                 )
             else:
                 await context.bot.send_photo(chat_id, data, filename=filename, caption=caption, **_UPLOAD_TIMEOUTS)
@@ -707,7 +718,10 @@ async def _send_media(update: Update, context: ContextTypes.DEFAULT_TYPE, result
         source = Path(item.path).read_bytes() if item.path else item.url
         caption = result.caption if index == 0 else None
         if item.kind == "video":
-            album.append(InputMediaVideo(source, caption=caption, supports_streaming=True))
+            album.append(InputMediaVideo(
+                source, caption=caption, supports_streaming=True, width=item.width, height=item.height,
+                duration=item.duration, thumbnail=Path(item.thumb).read_bytes() if item.thumb else None,
+            ))
         else:
             album.append(InputMediaPhoto(source, caption=caption))
     try:
@@ -950,6 +964,7 @@ def build_application() -> Application:
     category_pattern = rf"^(?:{kb.CB_CATEGORY}|{kb.CB_AGAIN}):(?:{categories})$"
     back_pattern = rf"^(?:{re.escape(kb.CB_BACK)}|{re.escape(kb.CB_HOME_NEW)})$"
     guide_pattern = rf"^{re.escape(kb.CB_GUIDE)}$"
+    adv_pattern = rf"^{re.escape(kb.CB_ADV)}$"
 
     conversation = ConversationHandler(
         entry_points=[
@@ -965,6 +980,7 @@ def build_application() -> Application:
         fallbacks=[
             CallbackQueryHandler(back_to_main, pattern=back_pattern),
             CallbackQueryHandler(show_guide, pattern=guide_pattern),
+            CallbackQueryHandler(show_adv_menu, pattern=adv_pattern),
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
         ],
@@ -981,6 +997,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CallbackQueryHandler(back_to_main, pattern=back_pattern))
     application.add_handler(CallbackQueryHandler(show_guide, pattern=guide_pattern))
+    application.add_handler(CallbackQueryHandler(show_adv_menu, pattern=adv_pattern))
     application.add_handler(
         CallbackQueryHandler(show_dorks_cheatsheet, pattern=rf"^{re.escape(kb.CB_GUIDE_DORKS)}$")
     )

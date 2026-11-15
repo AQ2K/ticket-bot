@@ -35,6 +35,7 @@ CB_AGAIN = "again"  # again:<قسم> ← بحث جديد برسالة جديدة
 CB_BACK = "back:main"  # رجوع للقائمة بتعديل نفس الرسالة
 CB_HOME_NEW = "home:new"  # فتح القائمة برسالة جديدة
 CB_GUIDE = "menu:guide"  # دليل المصادر
+CB_ADV = "menu:adv"  # قائمة البحث المتقدم (TikTok / Instagram / X)
 CB_GUIDE_DORKS = "guide:dorks"  # ورقة أوامر Google Dorks
 CB_ACTION = "a"  # a:<رمز>        ← تنفيذ إجراء تُعرض نتيجته داخل تيليجرام
 CB_PAGE = "p"  # p:<رمز>:<صفحة> ← التنقل بين صفحات نتائج البحث
@@ -72,6 +73,33 @@ CATEGORIES: dict[str, dict[str, str]] = {
             "✍️ أرسل اليوزر (مثل <code>khaby.lame</code>) أو رابط الحساب.\n\n"
             "سأعرض: الاسم، النبذة، المتابِعين، المتابَعين، عدد المنشورات، الإعجابات، التوثيق، "
             "تاريخ الإنشاء — مع صورة الحساب وآخر الفيديوهات داخل تيليجرام."
+        ),
+    },
+    "adv_tiktok": {
+        "title": "🎵 TikTok",
+        "prompt": (
+            "🕵️ <b>البحث المتقدم — 🎵 TikTok</b>\n\n"
+            "✍️ أرسل <b>يوزر</b> (مثل <code>@khaby.lame</code>) أو <b>اسم</b> أو <b>كلمة / هاشتاق</b>.\n\n"
+            "سأجهّز لك Google Dorks خاصة بـ TikTok (الحساب، الفيديوهات، الهاشتاقات، الأصوات...) "
+            "والنتائج تظهر هنا داخل تيليجرام."
+        ),
+    },
+    "adv_insta": {
+        "title": "📸 Instagram",
+        "prompt": (
+            "🕵️ <b>البحث المتقدم — 📸 Instagram</b>\n\n"
+            "✍️ أرسل <b>يوزر</b> (مثل <code>@instagram</code>) أو <b>اسم</b> أو <b>كلمة / هاشتاق</b>.\n\n"
+            "سأجهّز لك Google Dorks خاصة بـ Instagram (الحساب، المنشورات، الريلز، الهاشتاقات، الأماكن...) "
+            "والنتائج تظهر هنا داخل تيليجرام."
+        ),
+    },
+    "adv_x": {
+        "title": "𝕏 تويتر",
+        "prompt": (
+            "🕵️ <b>البحث المتقدم — 𝕏 تويتر</b>\n\n"
+            "✍️ أرسل <b>يوزر</b> (مثل <code>@NASA</code>) أو <b>اسم</b> أو <b>كلمة / هاشتاق</b>.\n\n"
+            "سأجهّز لك Google Dorks خاصة بـ X (الحساب، التغريدات، الإشارات، الهاشتاق...) "
+            "والنتائج تظهر هنا داخل تيليجرام."
         ),
     },
     "acc_tiktok": {
@@ -386,11 +414,28 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [
             [_cat("dorks")],
             [_cat("media"), _cat("accounts")],
-            [_cat("social")],
+            [Btn("🕵️ البحث المتقدم", callback_data=CB_ADV)],
             [_cat("domain"), _cat("ip")],
             [_cat("phone"), _cat("user")],
             [_cat("docs"), _cat("email")],
             [Btn("📚 دليل المصادر", callback_data=CB_GUIDE)],
+        ]
+    )
+
+
+ADV_MENU_TEXT = (
+    "🕵️ <b>البحث المتقدم</b>\n\n"
+    "اختر المنصة 👇\n"
+    "لكل منصة قائمة Google Dorks خاصة بها، والنتائج تظهر هنا داخل تيليجرام."
+)
+
+
+def adv_menu_keyboard() -> InlineKeyboardMarkup:
+    """🕵️ قائمة البحث المتقدم: TikTok / Instagram / تويتر."""
+    return InlineKeyboardMarkup(
+        [
+            [_cat("adv_tiktok"), _cat("adv_insta"), _cat("adv_x")],
+            [Btn("🔙 رجوع", callback_data=CB_BACK)],
         ]
     )
 

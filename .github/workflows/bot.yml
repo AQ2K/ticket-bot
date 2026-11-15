@@ -54,6 +54,13 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: 🎬 تجهيز ffmpeg (لتحويل المقاطع إلى H.264 وتشغيلها بسلاسة في تيليجرام)
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          fi
+          ffmpeg -version | head -1
+
       - name: 📦 تثبيت المكتبات
         run: pip install -r requirements.txt
 
