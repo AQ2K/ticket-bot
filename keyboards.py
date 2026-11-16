@@ -172,12 +172,13 @@ CATEGORIES: dict[str, dict[str, str]] = {
         ),
     },
     "docs": {
-        "title": "🔗 رابط/ملف (Docs)",
+        "title": "📁 سجلات",
         "prompt": (
-            "🔗 <b>وثائق وملفات</b>\n\n"
+            "📁 <b>سجلات — ملفات ووثائق منشورة علناً</b>\n\n"
             "✍️ أرسل <b>كلمة مفتاحية</b> أو اسماً أو موضوعاً للبحث عن الملفات المنشورة علناً "
             "(PDF / Word / Excel / PowerPoint).\n\n"
-            "💡 لحصر البحث داخل موقع معيّن أرسل رابطه كاملاً، مثل: <code>https://example.com</code>"
+            "💡 لحصر البحث داخل موقع معيّن أرسل رابطه كاملاً، مثل: <code>https://example.com</code>\n"
+            "🌐 <i>النتائج تفتح في Google بالمتصفح.</i>"
         ),
     },
     "email": {
@@ -372,7 +373,7 @@ def help_text(is_admin: bool, search_provider: str | None = None, stories_enable
         "/x <code>يوزر</code> — معلومات حساب X\n"
         "/account <code>يوزر</code> — الحساب على المنصات الثلاث معاً\n"
         "/dork <code>اسم أو دومين</code> — قائمة Google Dorks\n"
-        "/docs <code>احمد محمد</code> — وثائق وملفات\n"
+        "/docs <code>احمد محمد</code> — سجلات (ملفات ووثائق)\n"
         "/social <code>@username</code> — X و Instagram و TikTok\n"
         "/domain <code>example.com</code> — فحص دومين\n"
         "/ip <code>8.8.8.8</code> — فحص IP\n"

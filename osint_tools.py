@@ -853,7 +853,7 @@ def _extract_site(text: str) -> str | None:
 
 
 async def docs_lookup(query: str) -> LookupResult:
-    """البحث عن الوثائق والملفات المنشورة علناً — النتائج والملفات نفسها داخل تيليجرام."""
+    """📁 سجلات: البحث عن الوثائق والملفات المنشورة علناً — النتائج تفتح في Google بالمتصفح."""
     q = clean_query(query)
     site = _extract_site(q)
     all_types = "(filetype:pdf OR filetype:docx OR filetype:xlsx OR filetype:pptx)"
@@ -867,13 +867,11 @@ async def docs_lookup(query: str) -> LookupResult:
             ("📗 Excel", f"{base} (filetype:xls OR filetype:xlsx)"),
             ("📙 PowerPoint", f"{base} (filetype:ppt OR filetype:pptx)"),
             ("🗒️ TXT / CSV", f"{base} (filetype:txt OR filetype:csv)"),
+            ("📂 كل أنواع الملفات", f"{base} {all_types}"),
+            ("📄 الصفحات المفهرسة", base),
         ]
-        actions = [search_action(label, dork, docs=True) for label, dork in dorks]
-        actions += [
-            search_action("📂 كل أنواع الملفات", f"{base} {all_types}", docs=True, wide=True),
-            search_action("📄 الصفحات المفهرسة", base),
-            Action("🔬 فحوصات ولقطة شاشة", "urlscan", site),
-        ]
+        actions = [search_action(label, dork, browser=True) for label, dork in dorks]
+        actions.append(Action("🔬 فحوصات ولقطة شاشة", "urlscan", site))
         first, last = await asyncio.gather(
             _safe(wayback_snapshot(site, "19900101"), None, timeout=config.HTTP_TIMEOUT),
             _safe(wayback_snapshot(q), None, timeout=config.HTTP_TIMEOUT),
@@ -898,14 +896,13 @@ async def docs_lookup(query: str) -> LookupResult:
             ("📚 Scribd", f"site:scribd.com {base}"),
             ("🖥️ SlideShare", f"site:slideshare.net {base}"),
             ("🗃️ Google Docs/Drive", f"{base} (site:docs.google.com OR site:drive.google.com)"),
+            ("📂 كل أنواع الملفات", f"{base} {all_types}"),
         ]
-        file_kinds = {"📕 PDF", "📘 Word", "📗 Excel", "📙 PowerPoint"}
-        actions = [search_action(label, dork, docs=label in file_kinds) for label, dork in dorks]
-        actions.append(search_action("📂 كل أنواع الملفات", f"{base} {all_types}", docs=True, wide=True))
+        actions = [search_action(label, dork, browser=True) for label, dork in dorks]
         mode_lines = [f"🔤 كلمة البحث: <code>{esc(q)}</code>"]
 
     lines = [
-        f"📄 <b>وثائق — {esc(site or q)}</b>",
+        f"📁 <b>سجلات — {esc(site or q)}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
         *mode_lines,
@@ -913,12 +910,9 @@ async def docs_lookup(query: str) -> LookupResult:
         "<b>🔎 أمثلة على الاستعلامات المُولّدة:</b>",
         *[f"• <code>{esc(dork)}</code>" for _, dork in dorks[:4]],
         "",
-        _INSIDE_HINT,
-        "📥 <i>في نتائج الملفات اضغط زر التحميل ليصلك الملف نفسه هنا.</i>",
+        "🌐 اضغط أي زر ليفتح نتائج Google في متصفحك.",
     ]
-    # نتائج «كل أنواع الملفات» تظهر مباشرة تحت التقرير (عند تفعيل مفتاح البحث)
-    first = next(a for a in actions if a.label == "📂 كل أنواع الملفات")
-    return LookupResult(_join(lines), actions, autorun=first, autorun_needs_key=True)
+    return LookupResult(_join(lines), actions)
 
 
 def _wayback_line(label: str, snapshot: dict | None) -> str:
