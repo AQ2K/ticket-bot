@@ -1267,7 +1267,7 @@ def _profile_url(platform: str, username: str) -> str:
 
 
 def _platform_dorks(platform: str, query: str, username: str | None) -> list[tuple[str, str]]:
-    """استعلامات Google Dorks خاصة بكل منصة (الإشارات، التعليقات، الدويتو...)."""
+    """Google Dorks لكل منصة — فقط ما يمكن لـ Google إيجاده فعلاً (ما يظهر في وصف المنشور)."""
     term = phrase(username or query)
     name = SHORT_NAMES[platform]
     options: list[tuple[str, str]] = []
@@ -1275,7 +1275,6 @@ def _platform_dorks(platform: str, query: str, username: str | None) -> list[tup
         if username:
             options += [
                 ("🎬 مقاطع ذُكر فيها الحساب", f'site:tiktok.com inurl:video "@{username}"'),
-                ("💬 مقاطع فيها تعليقه/إشارته", f'site:tiktok.com inurl:video "@{username}" -inurl:/@{username}/'),
                 ("🔁 دويتو / ستيتش معه", f'site:tiktok.com inurl:video ("duet with @{username}" OR "stitch with @{username}")'),
                 ("📂 منشورات حسابه", f"site:tiktok.com/@{username}"),
                 ("🔗 ذكر الحساب خارج TikTok", f'"tiktok.com/@{username}" -site:tiktok.com'),
@@ -1292,7 +1291,6 @@ def _platform_dorks(platform: str, query: str, username: str | None) -> list[tup
             options += [
                 ("🏷️ منشورات ذُكر فيها", f'site:instagram.com/p "@{username}"'),
                 ("🎬 ريلز ذُكر فيها", f'site:instagram.com/reel "@{username}"'),
-                ("💬 تعليقات وإشارات له", f'site:instagram.com "@{username}" -inurl:/{username}/'),
                 ("📂 منشورات حسابه", f"site:instagram.com/{username}"),
                 ("🔗 ذكر الحساب خارج Instagram", f'"instagram.com/{username}" -site:instagram.com'),
             ]
@@ -1307,7 +1305,6 @@ def _platform_dorks(platform: str, query: str, username: str | None) -> list[tup
         if username:
             options += [
                 (f"💬 تغريدات تذكر @{username}", f'"@{username}" {_X_SITES} inurl:status'),
-                (f"↩️ ردود على @{username}", f'"to:{username}" OR "replying to @{username}" {_X_SITES}'),
                 ("📂 تغريدات حسابه", f"site:x.com/{username} OR site:twitter.com/{username}"),
                 ("🔗 ذكر الحساب خارج X", f'("x.com/{username}" OR "twitter.com/{username}") -site:x.com -site:twitter.com'),
             ]
@@ -1339,15 +1336,11 @@ async def platform_search_lookup(query: str, platform: str) -> LookupResult:
             actions.append(Action("🎬 آخر الفيديوهات (تحميل)", "tt_videos", username))
 
     likes_note = None
-    if username and platform == "tiktok":
+    if username and platform in ("tiktok", "instagram"):
         likes_note = (
-            "ℹ️ <i>«اللايكات» التي ضغطها الحساب مخفية افتراضياً في TikTok ولا تظهر لأي أداة خارجية. "
-            "الأزرار أعلاه تجد المقاطع التي ذُكر أو علّق أو عمل دويتو فيها (مما فهرسه Google).</i>"
-        )
-    elif username and platform == "instagram":
-        likes_note = (
-            "ℹ️ <i>Instagram لا يُظهر إعجابات أي حساب إطلاقاً — لكن الأزرار تجد المنشورات والريلز "
-            "التي ذُكر أو علّق فيها (مما فهرسه Google).</i>"
+            "ℹ️ <i>Google يفهرس <b>وصف المنشور فقط</b>، فالأزرار تجد المقاطع التي ذُكر/وُسم فيها الحساب "
+            "في الوصف (والدويتو/الستيتش في TikTok). أما <b>التعليقات والإعجابات</b> فتُحمَّل ديناميكياً "
+            "ولا يفهرسها Google، لذلك لا يمكن إيجاد المقاطع التي علّق أو أعجب بها الحساب — لا بهذا البوت ولا بغيره.</i>"
         )
 
     sep = "━━━━━━━━━━━━━━━━"
