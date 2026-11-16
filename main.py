@@ -336,7 +336,7 @@ async def receive_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 COMMAND_CATEGORIES: dict[str, str] = {
     "dl": "media", "account": "accounts", "tiktok": "acc_tiktok", "insta": "acc_insta", "x": "acc_x",
     "dork": "dorks", "dorks": "dorks", "docs": "docs", "social": "social", "domain": "domain",
-    "ip": "ip", "phone": "phone", "user": "user", "email": "email",
+    "ip": "ip", "phone": "phone", "user": "user", "email": "email", "leaks": "leaks", "leak": "leaks",
 }
 
 
@@ -993,7 +993,8 @@ async def post_init(application: Application) -> None:
         BotCommand("ip", "🌐 فحص IP — مثال: /ip 8.8.8.8"),
         BotCommand("phone", "📞 تحليل رقم — مثال: /phone +966501234567"),
         BotCommand("user", "👤 فحص يوزر في +550 موقع — مثال: /user john"),
-        BotCommand("email", "✉️ فحص إيميل وتسريبات — مثال: /email a@b.com"),
+        BotCommand("email", "✉️ فحص إيميل — مثال: /email a@b.com"),
+        BotCommand("leaks", "🔓 فحص التسريبات — إيميل/يوزر/هاتف/دومين"),
         BotCommand("help", "ℹ️ المساعدة وكل الأوامر"),
         BotCommand("cancel", "❌ إلغاء العملية الحالية"),
     ]

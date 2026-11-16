@@ -114,6 +114,19 @@ CATEGORIES: dict[str, dict[str, str]] = {
         "title": "𝕏 حساب X",
         "prompt": "𝕏 <b>معلومات حساب X (تويتر)</b>\n\n✍️ أرسل اليوزر أو رابط الحساب، مثل: <code>NASA</code>",
     },
+    "leaks": {
+        "title": "🔓 تسريبات",
+        "prompt": (
+            "🔓 <b>فحص التسريبات</b>\n\n"
+            "✍️ أرسل أحد التالي للكشف عمّا إذا كان ظهر في تسريبات معروفة:\n"
+            "• 📧 بريد إلكتروني — <code>name@example.com</code>\n"
+            "• 👤 اسم مستخدم — <code>john_doe</code>\n"
+            "• 📞 رقم هاتف — <code>+966501234567</code>\n"
+            "• 🌐 دومين — <code>example.com</code>\n\n"
+            "سأعرض: التسريبات، تاريخها، وأنواع البيانات المكشوفة (بريد، هاتف، كلمة مرور...).\n"
+            "🔒 <i>لا يتم عرض كلمات المرور نفسها — فقط حقيقة التسريب لحماية حسابك.</i>"
+        ),
+    },
     "social": {
         "title": "🕵️ بحث متقدم (X / Instagram / TikTok)",
         "prompt": (
@@ -365,7 +378,8 @@ def help_text(is_admin: bool, search_provider: str | None = None, stories_enable
         "/ip <code>8.8.8.8</code> — فحص IP\n"
         "/phone <code>+966501234567</code> — تحليل رقم هاتف\n"
         "/user <code>john_doe</code> — فحص يوزر في +550 موقع\n"
-        "/email <code>name@example.com</code> — فحص إيميل وتسريبات\n"
+        "/email <code>name@example.com</code> — فحص إيميل\n"
+        "/leaks <code>إيميل/يوزر/هاتف/دومين</code> — فحص التسريبات\n"
         "💡 اكتب الأمر وحده (مثل /docs) وسأطلب منك الهدف.\n\n"
         "<b>📋 أوامر عامة:</b>\n"
         "/start — القائمة الرئيسية\n"
@@ -436,6 +450,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             [_cat("domain"), _cat("ip")],
             [_cat("phone"), _cat("user")],
             [_cat("docs"), _cat("email")],
+            [_cat("leaks")],
         ]
     )
 
@@ -491,6 +506,11 @@ def results_keyboard(
     for action in actions:
         if action.kind == "url":
             button = Btn(action.label, url=action.value)
+        elif action.kind == "search" and "browser" in action.extra:
+            # دورك يفتح Google في متصفح المستخدم مباشرة
+            from osint_tools import google
+
+            button = Btn(action.label, url=google(action.value))
         else:
             button = Btn(action.label, callback_data=f"{CB_ACTION}:{register(action)}")
         if action.wide:
