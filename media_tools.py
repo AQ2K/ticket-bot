@@ -1329,16 +1329,14 @@ async def platform_search_lookup(query: str, platform: str) -> LookupResult:
     username = match.group(1) if match and re.fullmatch(_USERNAME_PATTERNS[platform], match.group(1)) else None
     options = _platform_dorks(platform, q, username)
 
-    # أزرار الدورك تعرض نتائجها داخل تيليجرام مباشرة (مرتبة في صفحات)
-    actions: list[Action] = [search_action(label, dork) for label, dork in options]
+    # أزرار الدورك تفتح نتائجها في Google بالمتصفح مباشرة
+    actions: list[Action] = [search_action(label, dork, browser=True) for label, dork in options]
     if username:
         profile = _profile_url(platform, username)
         actions.append(url_action("🔗 فتح صفحة الحساب", profile, wide=True))
         actions.append(Action("📊 معلومات الحساب", "lookup", username, (_ACCOUNT_CATEGORY[platform],)))
         if platform == "tiktok":
             actions.append(Action("🎬 آخر الفيديوهات (تحميل)", "tt_videos", username))
-    # أول زر بحث يُنفَّذ تلقائياً فتظهر نتائج مرتبة فوراً داخل تيليجرام
-    autorun = next((a for a in actions if a.kind == "search"), None)
 
     likes_note = None
     if username and platform == "tiktok":
@@ -1363,10 +1361,10 @@ async def platform_search_lookup(query: str, platform: str) -> LookupResult:
     header += [
         f"🧩 النوع: {'يوزر 👤' if username else 'اسم / كلمة / هاشتاق 🔤'}",
         sep,
-        "👇 اختر نوع البحث — النتائج تظهر مرتبة هنا داخل تيليجرام",
+        "🌐 اضغط أي زر ليفتح نتائج Google في متصفحك",
         likes_note,
     ]
-    return LookupResult(_join(header), actions, autorun=autorun, autorun_needs_key=True)
+    return LookupResult(_join(header), actions)
 
 
 async def adv_tiktok_lookup(query: str) -> LookupResult:
