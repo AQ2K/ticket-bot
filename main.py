@@ -987,7 +987,7 @@ async def post_init(application: Application) -> None:
         BotCommand("x", "𝕏 معلومات حساب X — مثال: /x NASA"),
         BotCommand("account", "📊 الحساب على TikTok و Instagram و X معاً"),
         BotCommand("dork", "🔎 Google Dorks — مثال: /dork اسم أو دومين"),
-        BotCommand("docs", "📄 وثائق وملفات — مثال: /docs احمد محمد"),
+        BotCommand("docs", "📁 سجلات (ملفات ووثائق) — مثال: /docs احمد محمد"),
         BotCommand("social", "🕵️ X و Instagram و TikTok — مثال: /social @user"),
         BotCommand("domain", "🌐 فحص دومين — مثال: /domain example.com"),
         BotCommand("ip", "🌐 فحص IP — مثال: /ip 8.8.8.8"),

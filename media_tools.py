@@ -20,7 +20,7 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,7 @@ from osint_tools import (
     get_client,
     phrase,
     search_action,
+    url_action,
     web_search,
 )
 
@@ -1257,103 +1258,115 @@ _ACCOUNT_CATEGORY = {"tiktok": "acc_tiktok", "instagram": "acc_insta", "x": "acc
 _X_SITES = "(site:x.com OR site:twitter.com)"
 
 
+def _profile_url(platform: str, username: str) -> str:
+    return {
+        "tiktok": f"https://www.tiktok.com/@{username}",
+        "instagram": f"https://www.instagram.com/{username}/",
+        "x": f"https://x.com/{username}",
+    }[platform]
+
+
 def _platform_dorks(platform: str, query: str, username: str | None) -> list[tuple[str, str]]:
-    """استعلامات Google Dorks خاصة بكل منصة."""
+    """استعلامات Google Dorks خاصة بكل منصة (الإشارات، التعليقات، الدويتو...)."""
     term = phrase(username or query)
-    year_ago = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
     name = SHORT_NAMES[platform]
     options: list[tuple[str, str]] = []
     if platform == "tiktok":
         if username:
             options += [
-                ("👤 صفحة الحساب", f"site:tiktok.com/@{username}"),
-                ("💬 تعليقات وإشارات الحساب", f'site:tiktok.com "@{username}" -site:tiktok.com/@{username}'),
-                ("🎬 فيديوهات ذُكر فيها", f'site:tiktok.com inurl:video "@{username}" -site:tiktok.com/@{username}'),
-                ("🔁 دويتو وستيتش معه", f'site:tiktok.com "@{username}" (duet OR stitch OR دويتو)'),
-                ("🔗 روابط للحساب خارج TikTok", f'"tiktok.com/@{username}" -site:tiktok.com'),
+                ("🎬 مقاطع ذُكر فيها الحساب", f'site:tiktok.com inurl:video "@{username}"'),
+                ("💬 مقاطع فيها تعليقه/إشارته", f'site:tiktok.com inurl:video "@{username}" -inurl:/@{username}/'),
+                ("🔁 دويتو / ستيتش معه", f'site:tiktok.com inurl:video ("duet with @{username}" OR "stitch with @{username}")'),
+                ("📂 منشورات حسابه", f"site:tiktok.com/@{username}"),
+                ("🔗 ذكر الحساب خارج TikTok", f'"tiktok.com/@{username}" -site:tiktok.com'),
             ]
-        options += [
-            ("🎬 الفيديوهات", f"site:tiktok.com inurl:video {term}"),
-            ("#️⃣ الهاشتاقات", f"site:tiktok.com/tag {term}"),
-            ("🎵 الأصوات", f"site:tiktok.com/music {term}"),
-        ]
+        else:
+            options += [
+                ("🎬 الفيديوهات", f"site:tiktok.com inurl:video {term}"),
+                ("#️⃣ الهاشتاقات", f"site:tiktok.com/tag {term}"),
+                ("🎵 الأصوات", f"site:tiktok.com/music {term}"),
+            ]
         base = "site:tiktok.com"
     elif platform == "instagram":
         if username:
             options += [
-                ("👤 صفحة الحساب", f"site:instagram.com/{username}"),
-                ("💬 تعليقات وإشارات الحساب", f'site:instagram.com "@{username}" -site:instagram.com/{username}'),
                 ("🏷️ منشورات ذُكر فيها", f'site:instagram.com/p "@{username}"'),
                 ("🎬 ريلز ذُكر فيها", f'site:instagram.com/reel "@{username}"'),
-                ("🔗 روابط للحساب خارج Instagram", f'"instagram.com/{username}" -site:instagram.com'),
+                ("💬 تعليقات وإشارات له", f'site:instagram.com "@{username}" -inurl:/{username}/'),
+                ("📂 منشورات حسابه", f"site:instagram.com/{username}"),
+                ("🔗 ذكر الحساب خارج Instagram", f'"instagram.com/{username}" -site:instagram.com'),
             ]
-        options += [
-            ("🖼️ المنشورات", f"site:instagram.com/p {term}"),
-            ("🎬 الريلز", f"site:instagram.com/reel {term}"),
-            ("#️⃣ الهاشتاقات", f"site:instagram.com/explore/tags {term}"),
-            ("📍 الأماكن", f"site:instagram.com/explore/locations {term}"),
-        ]
+        else:
+            options += [
+                ("🖼️ المنشورات", f"site:instagram.com/p {term}"),
+                ("🎬 الريلز", f"site:instagram.com/reel {term}"),
+                ("#️⃣ الهاشتاقات", f"site:instagram.com/explore/tags {term}"),
+            ]
         base = "site:instagram.com"
     else:
         if username:
             options += [
-                ("👤 صفحة الحساب", f"site:x.com/{username} OR site:twitter.com/{username}"),
-                (f"💬 إشارات @{username}", f'"@{username}" {_X_SITES}'),
-                ("🔗 روابط للحساب خارج X", f'("x.com/{username}" OR "twitter.com/{username}") -site:x.com -site:twitter.com'),
+                (f"💬 تغريدات تذكر @{username}", f'"@{username}" {_X_SITES} inurl:status'),
+                (f"↩️ ردود على @{username}", f'"to:{username}" OR "replying to @{username}" {_X_SITES}'),
+                ("📂 تغريدات حسابه", f"site:x.com/{username} OR site:twitter.com/{username}"),
+                ("🔗 ذكر الحساب خارج X", f'("x.com/{username}" OR "twitter.com/{username}") -site:x.com -site:twitter.com'),
             ]
-        tag = re.sub(r"\s+", "", (username or query).lstrip("#"))
-        options += [
-            ("📝 التغريدات", f"{_X_SITES} inurl:status {term}"),
-            ("#️⃣ الهاشتاق", f'{_X_SITES} "#{tag}"'),
-        ]
+        else:
+            tag = re.sub(r"\s+", "", query.lstrip("#"))
+            options += [
+                ("📝 التغريدات", f"{_X_SITES} inurl:status {term}"),
+                ("#️⃣ الهاشتاق", f'{_X_SITES} "#{tag}"'),
+            ]
         base = _X_SITES
-    options += [
-        (f"🔎 كل نتائج {name}", f"{base} {term}"),
-        ("📅 خلال آخر سنة", f"{base} {term} after:{year_ago}"),
-    ]
+    options.append((f"🔎 كل نتائج {name}", f"{base} {term}"))
     return options
 
 
 async def platform_search_lookup(query: str, platform: str) -> LookupResult:
-    """البحث المتقدم في منصة واحدة: قائمة Dorks جاهزة + نتائج «كل النتائج» مباشرة."""
+    """البحث المتقدم في منصة واحدة — النتائج مرتبة داخل تيليجرام + رابط صفحة الحساب."""
     q = clean_query(query)
     match = re.fullmatch(r"@?([A-Za-z0-9._]{2,30})", q)
     username = match.group(1) if match and re.fullmatch(_USERNAME_PATTERNS[platform], match.group(1)) else None
     options = _platform_dorks(platform, q, username)
 
-    # أزرار الدورك تفتح Google في المتصفح مباشرة
-    actions = [search_action(label, dork, browser=True) for label, dork in options]
+    # أزرار الدورك تعرض نتائجها داخل تيليجرام مباشرة (مرتبة في صفحات)
+    actions: list[Action] = [search_action(label, dork) for label, dork in options]
     if username:
+        profile = _profile_url(platform, username)
+        actions.append(url_action("🔗 فتح صفحة الحساب", profile, wide=True))
         actions.append(Action("📊 معلومات الحساب", "lookup", username, (_ACCOUNT_CATEGORY[platform],)))
         if platform == "tiktok":
             actions.append(Action("🎬 آخر الفيديوهات (تحميل)", "tt_videos", username))
+    # أول زر بحث يُنفَّذ تلقائياً فتظهر نتائج مرتبة فوراً داخل تيليجرام
+    autorun = next((a for a in actions if a.kind == "search"), None)
 
     likes_note = None
     if username and platform == "tiktok":
         likes_note = (
-            "ℹ️ <i>قائمة الفيديوهات التي أعجب بها الحساب خاصة افتراضياً في TikTok ولا يمكن لأي أداة رؤيتها من الخارج "
-            "— لكن «💬 تعليقات وإشارات» و«🎬 فيديوهات ذُكر فيها» تجد ما فهرسه Google.</i>"
+            "ℹ️ <i>«اللايكات» التي ضغطها الحساب مخفية افتراضياً في TikTok ولا تظهر لأي أداة خارجية. "
+            "الأزرار أعلاه تجد المقاطع التي ذُكر أو علّق أو عمل دويتو فيها (مما فهرسه Google).</i>"
         )
     elif username and platform == "instagram":
         likes_note = (
-            "ℹ️ <i>Instagram لا يعرض إعجابات أي حساب للآخرين إطلاقاً — لكن «💬 تعليقات وإشارات» "
-            "و«🏷️ منشورات ذُكر فيها» تجد ما فهرسه Google.</i>"
+            "ℹ️ <i>Instagram لا يُظهر إعجابات أي حساب إطلاقاً — لكن الأزرار تجد المنشورات والريلز "
+            "التي ذُكر أو علّق فيها (مما فهرسه Google).</i>"
         )
+
     sep = "━━━━━━━━━━━━━━━━"
-    text = _join([
+    header = [
         f"🕵️ <b>البحث المتقدم — {PLATFORM_NAMES[platform]}</b>",
         sep,
         f"🎯 الهدف: <code>{esc(q)}</code>",
+    ]
+    if username:
+        header.append(f'🔗 الصفحة: <a href="{esc_attr(_profile_url(platform, username))}">{esc(_profile_url(platform, username))}</a>')
+    header += [
         f"🧩 النوع: {'يوزر 👤' if username else 'اسم / كلمة / هاشتاق 🔤'}",
-        f"🧰 الخيارات: <b>{len(actions)}</b>",
         sep,
-        "🧠 <b>أمثلة على الـ Dorks:</b>",
-        *[f"▫️ <code>{esc(dork)}</code>" for _, dork in options[:3]],
-        sep,
-        "🌐 اضغط أي زر ليفتح نتائج Google في متصفحك",
+        "👇 اختر نوع البحث — النتائج تظهر مرتبة هنا داخل تيليجرام",
         likes_note,
-    ])
-    return LookupResult(text, actions)
+    ]
+    return LookupResult(_join(header), actions, autorun=autorun, autorun_needs_key=True)
 
 
 async def adv_tiktok_lookup(query: str) -> LookupResult:
