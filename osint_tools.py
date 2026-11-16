@@ -98,8 +98,12 @@ def url_action(label: str, url: str, *, wide: bool = False) -> Action:
     return Action(label, "url", url, wide=wide)
 
 
-def search_action(label: str, query: str, *, docs: bool = False, wide: bool = False) -> Action:
-    return Action(label, "search", query, ("docs",) if docs else (), wide)
+def search_action(
+    label: str, query: str, *, docs: bool = False, wide: bool = False, browser: bool = False
+) -> Action:
+    """زر بحث Google Dork. browser=True ← يفتح Google في المتصفح بدل عرض النتائج داخل تيليجرام."""
+    extra = tuple(tag for tag, on in (("docs", docs), ("browser", browser)) if on)
+    return Action(label, "search", query, extra, wide)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -797,12 +801,13 @@ async def social_lookup(query: str) -> LookupResult:
     ]
     combined = f"{term} (site:x.com OR site:instagram.com OR site:tiktok.com)"
 
-    actions = [search_action(label, dork) for label, dork in dorks]
-    actions.append(search_action("🌐 كل المنصات في بحث واحد", combined, wide=True))
+    # أزرار الدورك تفتح Google في المتصفح مباشرة
+    actions = [search_action(label, dork, browser=True) for label, dork in dorks]
+    actions.append(search_action("🌐 كل المنصات في بحث واحد", combined, wide=True, browser=True))
     if handle:
         actions += [
-            search_action("🗣️ إشارات للحساب خارج X", f'"@{handle}" -site:x.com -site:twitter.com'),
-            search_action("🔗 روابط الحساب (Linktree...)", f'"{handle}" (site:linktr.ee OR site:beacons.ai OR site:linkin.bio)'),
+            search_action("🗣️ إشارات للحساب خارج X", f'"@{handle}" -site:x.com -site:twitter.com', browser=True),
+            search_action("🔗 روابط الحساب (Linktree...)", f'"{handle}" (site:linktr.ee OR site:beacons.ai OR site:linkin.bio)', browser=True),
             Action("🧭 فحص اليوزر في +600 موقع", "wmn", handle, wide=True),
         ]
 
@@ -815,11 +820,10 @@ async def social_lookup(query: str) -> LookupResult:
         "<b>🔎 الاستعلامات المُولّدة (Google Dorks):</b>",
         *[f"• <code>{esc(dork)}</code>" for _, dork in dorks],
         "",
-        _INSIDE_HINT,
+        "🌐 اضغط أي زر ليفتح نتائج Google في متصفحك.",
         "💡 <i>نصيحة: جرّب الاسم بالعربية والإنجليزية للحصول على نتائج أشمل.</i>",
     ]
-    # نتائج «كل المنصات» تظهر مباشرة تحت التقرير (عند تفعيل مفتاح البحث)
-    return LookupResult(_join(lines), actions, autorun=actions[4], autorun_needs_key=True)
+    return LookupResult(_join(lines), actions)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1846,6 +1850,257 @@ async def email_lookup(query: str) -> LookupResult:
 
 
 # ═══════════════════════════════════════════════════════════
+# 🔓 فحص التسريبات (Data Breaches)
+# ═══════════════════════════════════════════════════════════
+# يعرض: في أي تسريبات ظهر الهدف، متى، وما نوع البيانات المسرّبة (بريد، هاتف، كلمة مرور...)
+# ⚠️ لا يعرض كلمات المرور نفسها — فقط حقيقة تسريبها ونوعها، مع نصائح الحماية.
+# المصادر المجانية: XposedOrNot (للبريد) و LeakCheck public (بريد/يوزر/هاتف/دومين).
+
+# تصنيف حقول LeakCheck إلى مجموعات عربية بإيموجي
+_LEAK_FIELD_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("🔑 كلمات المرور", ("password", "hashed_password", "hash", "salt")),
+    ("📧 البريد الإلكتروني", ("email", "emails")),
+    ("👤 اسم المستخدم", ("username", "login", "nick")),
+    ("📞 رقم الهاتف", ("phone", "mobile", "telephone")),
+    ("🪪 الاسم", ("name", "first_name", "last_name", "middle_name", "fullname")),
+    ("📍 العنوان", ("address", "city", "state", "zip", "country", "area", "region", "postal")),
+    ("🎂 تاريخ الميلاد", ("dob", "birthday", "birthdate", "age")),
+    ("🌐 عنوان IP", ("ip", "ip1", "ip2", "ip_address", "last_ip", "reg_ip")),
+    ("⚧️ الجنس", ("gender", "sex")),
+    ("🏢 الشركة / العمل", ("company", "job", "occupation")),
+)
+
+
+def _count(value: Any) -> str | None:
+    """تنسيق عدد السجلات: 24922471 ← 24.9M."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    for divisor, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if number >= divisor:
+            return f"{number / divisor:.1f}".removesuffix(".0") + suffix
+    return f"{number:,}"
+
+
+def _leak_data_types(fields: list[str]) -> list[str]:
+    """تحويل أسماء الحقول المسرّبة إلى مجموعات عربية مقروءة."""
+    lowered = {str(f).lower() for f in fields}
+    groups = []
+    for label, keys in _LEAK_FIELD_GROUPS:
+        if lowered & set(keys):
+            groups.append(label)
+    return groups
+
+
+def _has_password_field(fields: list[str]) -> bool:
+    return bool({str(f).lower() for f in fields} & {"password", "hashed_password", "hash"})
+
+
+async def leakcheck_public(query: str) -> dict | None:
+    """LeakCheck public API: عدد التسريبات، المصادر، وأنواع الحقول — بدون قيمة كلمة المرور نفسها."""
+    data = await _get_json("https://leakcheck.io/api/public", params={"check": query}, timeout=20)
+    if not isinstance(data, dict) or not data.get("success"):
+        return None
+    return {
+        "found": int(data.get("found") or 0),
+        "fields": [str(f) for f in data.get("fields") or []],
+        "sources": [
+            {"name": str(s.get("name") or "غير معروف"), "date": str(s.get("date") or "")}
+            for s in data.get("sources") or []
+            if isinstance(s, dict)
+        ],
+    }
+
+
+async def xposed_email(email: str) -> dict | None:
+    """XposedOrNot: تفاصيل تسريبات البريد (الاسم، التاريخ، نوع البيانات، خطورة كلمات المرور)."""
+    data = await _get_json(
+        f"https://api.xposedornot.com/v1/breach-analytics?email={quote(email, safe='@')}", timeout=20
+    )
+    if not isinstance(data, dict):
+        return None
+    details = (data.get("ExposedBreaches") or {}).get("breaches_details") or []
+    metrics = data.get("BreachMetrics") or {}
+    risk = (metrics.get("risk") or [{}])[0] if metrics.get("risk") else {}
+    strength = (metrics.get("passwords_strength") or [{}])[0] if metrics.get("passwords_strength") else {}
+    breaches = [
+        {
+            "name": b.get("breach"),
+            "date": str(b.get("xposed_date") or ""),
+            "records": b.get("xposed_records"),
+            "data": [d.strip() for d in str(b.get("xposed_data") or "").split(";") if d.strip()],
+            "domain": b.get("domain"),
+            "pw_risk": b.get("password_risk"),
+        }
+        for b in details
+        if isinstance(b, dict) and b.get("breach")
+    ]
+    return {
+        "breaches": breaches,
+        "risk_label": risk.get("risk_label"),
+        "risk_score": risk.get("risk_score"),
+        "plaintext": int(strength.get("PlainText") or 0),
+        "easy": int(strength.get("EasyToCrack") or 0),
+        "strong": int(strength.get("StrongHash") or 0),
+    }
+
+
+_RISK_ICON = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢"}
+
+
+def _detect_leak_target(q: str) -> tuple[str, str]:
+    """تحديد نوع الهدف: email / phone / domain / username — وتطبيعه."""
+    q = q.strip()
+    if _EMAIL_RE.match(q.lower()):
+        return "email", q.lower()
+    digits = re.sub(r"[\s\-()]", "", q.translate(_DIGITS_TABLE)).lstrip("+")
+    if digits.isdigit() and 7 <= len(digits) <= 15 and not re.search(r"[A-Za-z]", q):
+        return "phone", digits
+    if "." in q and " " not in q and not q.lstrip("@").replace(".", "").replace("_", "").isalnum():
+        try:
+            return "domain", normalize_domain(q)
+        except InvalidInput:
+            pass
+    if "." in q and " " not in q and re.search(r"\.[a-z]{2,}$", q.lower()):
+        try:
+            return "domain", normalize_domain(q)
+        except InvalidInput:
+            pass
+    handle = q.lstrip("@").strip()
+    if _USERNAME_RE.fullmatch(handle):
+        return "username", handle
+    raise InvalidInput(
+        "❌ أرسل بريداً إلكترونياً، أو يوزر، أو رقم هاتف (بالصيغة الدولية)، أو دومين.\n"
+        "مثال: <code>name@example.com</code> أو <code>john_doe</code> أو <code>+966501234567</code>"
+    )
+
+
+_LEAK_KINDS_AR = {"email": "📧 بريد إلكتروني", "phone": "📞 رقم هاتف", "domain": "🌐 دومين", "username": "👤 يوزر"}
+
+
+async def leaks_lookup(query: str) -> LookupResult:
+    """🔓 فحص التسريبات: في أي تسريبات ظهر الهدف وما نوع البيانات المكشوفة (دون عرض كلمات المرور)."""
+    kind, target = _detect_leak_target(clean_query(query))
+
+    xposed = await _safe(xposed_email(target), None, timeout=25) if kind == "email" else None
+    leakcheck = await _safe(leakcheck_public(target), None, timeout=20)
+
+    lines: list[str | None] = [
+        "🔓 <b>فحص التسريبات</b>",
+        "━━━━━━━━━━━━━━━━",
+        f"🎯 الهدف: <code>{esc(target)}</code>",
+        f"🧩 النوع: {_LEAK_KINDS_AR[kind]}",
+    ]
+
+    xp_breaches = xposed.get("breaches") if xposed else []
+    lc_found = leakcheck.get("found", 0) if leakcheck else 0
+    lc_sources = leakcheck.get("sources", []) if leakcheck else []
+    lc_fields = leakcheck.get("fields", []) if leakcheck else []
+    clean = not xp_breaches and not lc_found
+
+    if xposed is None and leakcheck is None:
+        lines += ["━━━━━━━━━━━━━━━━", "⚠️ تعذّر الوصول لقواعد التسريبات حالياً — حاول بعد قليل."]
+        return LookupResult(_join(lines), _leak_actions(kind, target))
+
+    if clean:
+        lines += [
+            "━━━━━━━━━━━━━━━━",
+            "✅ <b>لم يظهر هذا الهدف في أي تسريب معروف.</b>",
+            "💡 استمر في استخدام كلمة مرور قوية وفريدة والتحقق بخطوتين (2FA).",
+        ]
+        return LookupResult(_join(lines), _leak_actions(kind, target))
+
+    # ملخص الخطورة
+    if xposed and xposed.get("risk_label"):
+        icon = _RISK_ICON.get(str(xposed["risk_label"]), "⚪")
+        lines.append(f"⚠️ مستوى الخطورة: {icon} <b>{esc(xposed['risk_label'])}</b> ({xposed.get('risk_score', '?')}/100)")
+    total_breaches = len(xp_breaches)
+    summary = []
+    if total_breaches:
+        summary.append(f"🗂️ <b>{total_breaches}</b> تسريب معروف")
+    if lc_found:
+        summary.append(f"📊 <b>{lc_found}</b> سجل في قواعد الاختراقات")
+    lines += ["━━━━━━━━━━━━━━━━", " • ".join(summary) if summary else "🔴 <b>ظهر الهدف في تسريبات.</b>"]
+
+    # أنواع البيانات المكشوفة
+    data_types = set(_leak_data_types(lc_fields))
+    for breach in xp_breaches:
+        data_types.update(_xp_data_to_groups(breach.get("data", [])))
+    if data_types:
+        ordered = [label for label, _ in _LEAK_FIELD_GROUPS if label in data_types]
+        lines += ["", "<b>🧬 أنواع البيانات المكشوفة:</b>", "، ".join(ordered)]
+
+    # كلمات المرور — حقيقة التسريب فقط، لا القيمة
+    password_leaked = _has_password_field(lc_fields) or any(
+        (b.get("pw_risk") or "unknown") != "unknown" for b in xp_breaches
+    ) or (xposed and (xposed["plaintext"] or xposed["easy"] or xposed["strong"]))
+    if password_leaked:
+        pw_lines = ["", "<b>🔑 كلمات المرور:</b> ⚠️ ظهرت ضمن البيانات المسرّبة"]
+        if xposed and (xposed["plaintext"] or xposed["easy"] or xposed["strong"]):
+            pw_lines.append(
+                f"   • نص صريح: {xposed['plaintext']} • سهلة الكسر: {xposed['easy']} • مشفّرة بقوة: {xposed['strong']}"
+            )
+        pw_lines.append("🔒 <i>البوت لا يعرض كلمة المرور نفسها — غيّرها فوراً في كل موقع استُخدمت فيه وفعّل التحقق بخطوتين.</i>")
+        lines += pw_lines
+
+    # تفاصيل التسريبات (XposedOrNot)
+    if xp_breaches:
+        lines += ["", "<b>🗂️ أبرز التسريبات:</b>"]
+        for breach in xp_breaches[:12]:
+            year = breach["date"][:4] if breach.get("date") else ""
+            records = f" • {_count(breach['records'])} سجل" if breach.get("records") else ""
+            lines.append(f"• <b>{esc(breach['name'])}</b>" + (f" ({year})" if year else "") + records)
+        if len(xp_breaches) > 12:
+            lines.append(f"• <i>(+{len(xp_breaches) - 12} تسريب آخر)</i>")
+
+    # مصادر LeakCheck (أسماء فقط)
+    if lc_sources:
+        names = ", ".join(esc(s["name"]) for s in lc_sources[:10])
+        more = f" <i>(+{len(lc_sources) - 10})</i>" if len(lc_sources) > 10 else ""
+        lines += ["", f"<b>📂 مصادر إضافية:</b> {names}{more}"]
+
+    lines += [
+        "━━━━━━━━━━━━━━━━",
+        "🛡️ <b>ماذا تفعل؟</b> غيّر كلمات المرور المتكررة، فعّل التحقق بخطوتين، واحذر رسائل التصيّد.",
+        "ℹ️ <i>للاستخدام الدفاعي: افحص حساباتك أنت لحمايتها.</i>",
+    ]
+    return LookupResult(_join(lines), _leak_actions(kind, target))
+
+
+_XP_DATA_MAP = (
+    ("🔑 كلمات المرور", ("password",)),
+    ("📧 البريد الإلكتروني", ("email",)),
+    ("👤 اسم المستخدم", ("username",)),
+    ("📞 رقم الهاتف", ("phone",)),
+    ("🪪 الاسم", ("name",)),
+    ("📍 العنوان", ("address", "geographic", "location")),
+    ("🎂 تاريخ الميلاد", ("birth", "age")),
+    ("🌐 عنوان IP", ("ip address",)),
+    ("⚧️ الجنس", ("gender",)),
+)
+
+
+def _xp_data_to_groups(data: list[str]) -> set[str]:
+    joined = " ".join(data).lower()
+    return {label for label, keys in _XP_DATA_MAP if any(k in joined for k in keys)}
+
+
+def _leak_actions(kind: str, target: str) -> list[Action]:
+    """أزرار فحص يدوي إضافي تفتح في المتصفح."""
+    actions: list[Action] = []
+    if kind == "email":
+        actions += [
+            url_action("🔐 Have I Been Pwned", f"https://haveibeenpwned.com/account/{quote(target, safe='@')}"),
+            url_action("🧬 XposedOrNot", f"https://xposedornot.com/email/{quote(target, safe='@')}"),
+        ]
+    elif kind == "domain":
+        actions.append(url_action("🔐 HIBP — تسريبات النطاق", "https://haveibeenpwned.com/DomainSearch"))
+    actions.append(url_action("🔎 LeakCheck", f"https://leakcheck.io/?check={quote(target, safe='@')}", wide=True))
+    return actions
+
+
+# ═══════════════════════════════════════════════════════════
 # 📥 تحميل الملفات لإرسالها داخل تيليجرام
 # ═══════════════════════════════════════════════════════════
 
@@ -2023,6 +2278,7 @@ LOOKUPS: dict[str, Callable[[str], Awaitable[LookupResult]]] = {
     "user": username_lookup,
     "docs": docs_lookup,
     "email": email_lookup,
+    "leaks": leaks_lookup,
 }
 
 
